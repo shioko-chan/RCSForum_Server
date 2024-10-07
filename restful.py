@@ -9,7 +9,7 @@ class CheckIn(Resource):
     def post(self):
         json_data = request.get_json()
         print(json_data)
-        return {"message": "fuck you"}
+        return {"message": "message"}
 
 
 api.add_resource(CheckIn, "/checkin")
