@@ -3,8 +3,9 @@ from flask_restful import Api, Resource
 import threading
 import requests
 import logging
-import signal
 import time
+
+token_lock = threading.Lock()
 
 
 def renew_app_access_token():
@@ -20,7 +21,8 @@ def renew_app_access_token():
         data = res.json()
         if res.status_code == 200 and data["code"] == 0:
             time_to_live = max(float(data["expire"]) - 300.0, 300.0)
-            app.config["APP_ACCESS_TOKEN"] = data["app_access_token"]
+            with token_lock:
+                app.config["APP_ACCESS_TOKEN"] = data["app_access_token"]
             app.logger.info(
                 f"Successfully update app access token, next update is {time_to_live} seconds later."
             )
