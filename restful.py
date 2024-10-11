@@ -57,6 +57,7 @@ if __name__ == "__main__":
     api.add_resource(Login, "/login")
 
     def renew_app_token():
+        print("called")
         ttl = renew_app_access_token()
         while ttl:
             time.sleep(ttl)
@@ -66,4 +67,4 @@ if __name__ == "__main__":
         target=renew_app_token, name="renew app access token", daemon=True
     ).start()
 
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
