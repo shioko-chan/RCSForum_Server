@@ -1,13 +1,18 @@
-from typing import Union
-from fastapi import FastAPI, Response, Header
+from typing import Annotated, List, Optional
+from fastapi import FastAPI, Response, Header, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
 
-import httpx
+import coloredlogs
 
-from typing import Annotated
+import httpx
+import aiofiles
+
+from datetime import datetime
+from pathlib import Path
 import asyncio
 import logging
 import time
@@ -16,19 +21,23 @@ import uuid
 
 import config
 
-logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
+coloredlogs.install(level=logging.INFO, logger=logger)
 
 token_lock = asyncio.Lock()
 app_access_token = None
 
 client = MongoClient("mongodb://localhost:27017/")
-db = client["mydatabase"]
-poster = db["poster"]
-user = db["user"]
-comment = db["comment"]
+db = client["rcsforum"]
+poster_collection = db["poster"]
+user_collection = db["user"]
 
-user.create_index(["cid", ASCENDING])
+checkin_collection_name = "checkin_{}"
+checkin_collection_index = 0
+checkin_collection = db[checkin_collection_name.format(checkin_collection_index)]
+
+user_collection.create_index([("cid", ASCENDING)])
 
 
 def retry_with_limit(max_retry=5):
@@ -92,25 +101,6 @@ async def renew_app_token():
             await asyncio.sleep(60.0)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    asyncio.create_task(renew_app_token())
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-class Item(BaseModel):
-    name: str
-    price: float
-    is_offer: Union[bool, None] = None
-
-
-class TempCode(BaseModel):
-    code: str
-
-
 @retry_with_limit(max_retry=3)
 async def limited_api_req(url, headers, json, method="POST"):
     async with httpx.AsyncClient() as client:
@@ -168,22 +158,37 @@ async def update_authorization(code):
 
         cid = uuid.uuid4()
         id = ObjectId(open_id)
-        current_user = user.find_one({"_id": id})
+        current_user = user_collection.find_one({"_id": id})
 
         if not current_user:
-            user.insert_one({"_id": id, "cid": cid, "time": math.floor(time.time())})
+            user_collection.insert_one(
+                {
+                    "_id": id,
+                    "cid": cid,
+                    "time": math.floor(time.time()),
+                    "avatar": avatar,
+                    "name": name,
+                }
+            )
         else:
-            user.update_one(
+            user_collection.update_one(
                 {"_id": id},
-                {"$set": {"cid": cid, "time": math.floor(time.time())}},
+                {
+                    "$set": {
+                        "cid": cid,
+                        "time": math.floor(time.time()),
+                        "avatar": avatar,
+                        "name": name,
+                    }
+                },
             )
         return (cid, name, avatar), None
 
 
-def authorization(user_token, magnitude="strong"):
-    current_user = user.find_one({"cid": user_token})
-    if not current_user:
-        return False
+def authenticate(user_token, magnitude="strong"):
+    user_document = user_collection.find_one({"cid": user_token})
+    if not user_document:
+        return False, None
     expire_duration = None
     match magnitude:
         case "strong":
@@ -193,13 +198,26 @@ def authorization(user_token, magnitude="strong"):
         case _:
             raise ValueError(f"Magnitude {magnitude} is not defined")
 
-    if time.time() - current_user.get("time") > expire_duration:
-        return False
-    return True
+    if time.time() - user_document.get("time") > expire_duration:
+        return False, None
+    return True, user_document.get("_id")
+
+
+@asynccontextmanager
+def lifespan(app: FastAPI):
+    asyncio.create_task(renew_app_token())
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+class TempCodeForm(BaseModel):
+    code: str
 
 
 @app.post("/login")
-async def login(temp_code: TempCode, response: Response):
+async def login(temp_code: TempCodeForm, response: Response):
     val, err = await update_authorization(temp_code.code)
     if err is not None:
         return {"status": err}
@@ -208,10 +226,189 @@ async def login(temp_code: TempCode, response: Response):
     return {"status": 0, "name": name, "avatar": avatar}
 
 
-@app.get("/checkin")
-async def checkin(authorization: Annotated[str, Header()]):
-    if authorization(authorization, "weak"):
+@app.get("/checkin/keepalive")
+def keepalive(authentication: Annotated[str, Header()]):
+    res, open_id = authenticate(authentication, "weak")
+    if not res:
         return {"status": 1}
+
+    document = checkin_collection.find_one({"_id": open_id})
+    if document:
+        checkin_collection.update_one(
+            {"_id": open_id}, {"$inc": {"time": config.KEEP_ALIVE_INTERVAL}}
+        )
+    else:
+        checkin_collection.insert_one(
+            {"_id": open_id, "time": config.KEEP_ALIVE_INTERVAL}
+        )
+
+    return {"status": 0}
+
+
+@app.get("/checkin/hello")
+def hello(authentication: Annotated[str, Header()]):
+    res, open_id = authenticate(authentication, "strong")
+    if not res:
+        return {"status": 1}
+
+    document = checkin_collection.find_one({"_id": open_id})
+    if not document:
+        checkin_collection.insert_one({"_id": open_id, "time": 0})
+
+    return {"status": 0}
+
+
+class PosterForm(BaseModel):
+    title: str
+    content: str
+    images: List[UploadFile]
+
+
+@app.post("/newtopic")
+async def newtopic(authentication: Annotated[str, Header()], poster: PosterForm):
+    res, open_id = authenticate(authentication, "strong")
+    if not res:
+        return {"status": 1}
+
+    images_stored = []
+    for image in poster.images:
+        if not image.content_type.startswith("image/"):
+            continue
+        suffix = Path(image.filename).suffix
+        if suffix not in [
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".bmp",
+            ".gif",
+            ".tiff",
+        ]:
+            continue
+        filename = f"{uuid.uuid4()}{suffix}"
+        path = Path(config.UPLOAD_FOLDER).joinpath(filename)
+        async with aiofiles.open(path, "wb") as out_image:
+            await out_image.write(await image.read())
+        images_stored.append(filename)
+
+    poster_collection.insert_one(
+        {
+            "uid": open_id,
+            "title": poster.title,
+            "content": poster.content,
+            "timestamp": time.time(),
+            "images": images_stored,
+            "comments": [],
+        }
+    )
+    return {"status": 0}
+
+
+class DelTopicForm(BaseModel):
+    pid: str
+
+
+@app.post("/deltopic")
+def delete_topic(authentication: Annotated[str, Header()], deltopic: DelTopicForm):
+    res, open_id = authenticate(authentication, "strong")
+    if not res:
+        return {"status": 1}
+    poster_document = poster_collection.find_one({"_id": ObjectId(deltopic.pid)})
+    if not poster_document:
+        return {"status": 2}
+    if poster_document.get("uid") != open_id:
+        return {"status": 3}
+    poster_collection.delete_one({"_id": poster_document.get("_id")})
+    return {"status": 0}
+
+
+class CommentForm(BaseModel):
+    content: str
+    pid: str
+    repeat_id: Optional[int] = None
+
+
+@app.post("/comment")
+def comment(authentication: Annotated[str, Header()], comment_form: CommentForm):
+    res, open_id = authenticate(authentication, "strong")
+    if not res:
+        return {"status": 1}
+    poster_document = poster_collection.find_one({"_id": ObjectId(comment_form.pid)})
+    if not poster_document:
+        return {"status": 2}
+    if not comment_form.repeat_id:
+        poster_collection.update_one(
+            {"_id": poster_document.get("_id")},
+            {
+                "$push": {
+                    "comments": {
+                        "content": comment_form.content,
+                        "timestamp": time.time(),
+                        "pid": open_id,
+                        "sub": [],
+                    }
+                }
+            },
+        )
+    else:
+        poster_collection.update_one(
+            {"_id": poster_document.get("_id")},
+            {
+                "$push": {
+                    f"comments.{comment_form.repeat_id}.sub": {
+                        "content": comment_form.content,
+                        "timestamp": time.time(),
+                        "pid": open_id,
+                    }
+                }
+            },
+        )
+    return {"status": 0}
+
+
+class TopicFetchForm(BaseModel):
+    page: int
+
+
+@app.post("/topic")
+def topic(topic_fetch_form: TopicFetchForm):
+    topics = []
+    for document in (
+        poster_collection.find({}, {"comments": 0})
+        .skip(config.PAGE_SIZE * topic_fetch_form.page)
+        .limit(config.PAGE_SIZE)
+    ):
+        user_document = user_collection.find_one(
+            {"_id": document.get("uid")}, {"avatar": 1, "name": 1}
+        )
+        topics.append(
+            {
+                "title": document.get("title"),
+                "content": document.get("content"),
+                "timestamp": datetime.fromtimestamp(document.get("timestamp")).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "images": document.get("images"),
+                "pid": str(document.get("_id")),
+                "avatar": user_document.get("avatar"),
+                "name": user_document.get("name"),
+            }
+        )
+
+    return {"status": 0, "topics": topics}
+
+
+@app.get("/image/{filename}")
+def get_image(filename: str):
+    return FileResponse(Path(config.UPLOAD_FOLDER).joinpath(filename))
+
+
+@app.post("/routine")
+async def routine(x_api_key: Annotated[str, Header()]):
+    if x_api_key != config.X_API_KEY:
+        return {"status": 1}
+    global checkin_collection_name, checkin_collection, db, checkin_collection_index
+    checkin_collection_index += 1
+    checkin_collection = db[checkin_collection_name.format(checkin_collection_index)]
     return {"status": 0}
 
 
