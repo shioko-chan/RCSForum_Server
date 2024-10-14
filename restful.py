@@ -3,7 +3,7 @@ from fastapi import FastAPI, Response, Header, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-from pymongo import MongoClient, ASCENDING
+from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
 
 import coloredlogs
@@ -28,7 +28,7 @@ coloredlogs.install(level=logging.INFO, logger=logger)
 app_access_token = None
 app_access_token_lock = asyncio.Lock()
 
-client = MongoClient("mongodb://localhost:27017/")
+client = AsyncIOMotorClient("mongodb://localhost:27017/")
 db = client["rcsforum"]
 poster_collection = db["poster"]
 user_collection = db["user"]
@@ -38,7 +38,10 @@ checkin_collections.insert_one({"index": 0})
 checkin_collection = db["checkin_collection"]
 checkin_collection_lock = asyncio.Lock()
 
-user_collection.create_index([("cid", ASCENDING)])
+
+async def create_index():
+    res = await user_collection.create_index("cid")
+    logger.info(f"create index on user collection, index name: {res}")
 
 
 def retry_with_limit(max_retry=5):
@@ -102,6 +105,16 @@ async def renew_app_token():
             await asyncio.sleep(60.0)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await create_index()
+    asyncio.create_task(renew_app_token())
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
 @retry_with_limit(max_retry=3)
 async def limited_api_req(url, headers, json, method="POST"):
     async with httpx.AsyncClient() as client:
@@ -159,10 +172,10 @@ async def update_authorization(code):
 
         cid = uuid.uuid4()
         id = ObjectId(open_id)
-        current_user = user_collection.find_one({"_id": id})
+        current_user = await user_collection.find_one({"_id": id})
 
         if not current_user:
-            user_collection.insert_one(
+            await user_collection.insert_one(
                 {
                     "_id": id,
                     "cid": cid,
@@ -172,7 +185,7 @@ async def update_authorization(code):
                 }
             )
         else:
-            user_collection.update_one(
+            await user_collection.update_one(
                 {"_id": id},
                 {
                     "$set": {
@@ -186,8 +199,11 @@ async def update_authorization(code):
         return (cid, name, avatar), None
 
 
-def authenticate(user_token, magnitude="strong"):
-    user_document = user_collection.find_one({"cid": user_token}, {"_id": 1, "time": 1})
+async def authenticate(user_token: str, magnitude="strong"):
+    user_token = uuid.UUID(hex=user_token)
+    user_document = await user_collection.find_one(
+        {"cid": user_token}, {"_id": 1, "time": 1}
+    )
     if not user_document:
         return False, None
 
@@ -206,15 +222,6 @@ def authenticate(user_token, magnitude="strong"):
     return True, user_document.get("_id")
 
 
-@asynccontextmanager
-def lifespan(app: FastAPI):
-    asyncio.create_task(renew_app_token())
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
-
-
 class TempCodeForm(BaseModel):
     code: str
 
@@ -231,38 +238,59 @@ async def login(temp_code_form: TempCodeForm, response: Response):
 
 @app.get("/checkin/keepalive")
 async def keep_alive(authentication: Annotated[str, Header()]):
-    res, open_id = authenticate(authentication, "weak")
+    res, open_id = await authenticate(authentication, "weak")
     if not res:
         return {"status": 1}
     async with checkin_collection_lock:
-        document = checkin_collection.find_one({"_id": open_id})
+        document = await checkin_collection.find_one({"_id": open_id})
         if document:
             if (
-                checkin_collection.update_one(
+                await checkin_collection.update_one(
                     {"_id": open_id}, {"$inc": {"time": config.KEEP_ALIVE_INTERVAL}}
-                ).modified_count
-                != 1
-            ):
+                )
+            ).modified_count != 1:
                 return {"status": 2}
         else:
-            checkin_collection.insert_one(
-                {"_id": open_id, "time": config.KEEP_ALIVE_INTERVAL}
-            )
+            if (
+                await checkin_collection.insert_one(
+                    {"_id": open_id, "time": config.KEEP_ALIVE_INTERVAL}
+                )
+            ).inserted_id is None:
+                return {"status": 3}
     return {"status": 0}
 
 
 @app.get("/checkin/hello")
 async def hello(authentication: Annotated[str, Header()]):
-    res, open_id = authenticate(authentication, "strong")
+    res, open_id = await authenticate(authentication, "strong")
     if not res:
         return {"status": 1}
-
     async with checkin_collection_lock:
-        document = checkin_collection.find_one({"_id": open_id})
+        document = await checkin_collection.find_one({"_id": open_id})
         if not document:
-            checkin_collection.insert_one({"_id": open_id, "time": 0})
-
+            if (
+                await checkin_collection.insert_one({"_id": open_id, "time": 0})
+            ).inserted_id is None:
+                return {"status": 2}
     return {"status": 0}
+
+
+@app.get("/checkin/rank")
+async def rank():
+    rank_list = []
+    async with checkin_collection_lock:
+        for mark in await checkin_collection.find():
+            open_id = mark.get("_id")
+            user_document = await user_collection.find_one({"_id": open_id})
+            if user_document:
+                rank_list.append(
+                    {
+                        "avatar": user_document.get("avatar"),
+                        "name": user_document.get("name"),
+                        "time": mark.get("time"),
+                    }
+                )
+    return {"status": 0, "rank": rank_list}
 
 
 async def store_images(image_list: List[UploadFile]):
@@ -296,30 +324,35 @@ def get_image(filename: str):
 class CreatePosterForm(BaseModel):
     title: str
     content: str
+    is_anonymous: bool
     images: Optional[List[UploadFile]]
 
 
-@app.post("/createtopic")
+@app.post("/create/topic")
 async def create_topic(
     authentication: Annotated[str, Header()], create_poster_form: CreatePosterForm
 ):
-    res, open_id = authenticate(authentication, "strong")
+    res, open_id = await authenticate(authentication, "strong")
     if not res:
         return {"status": 1}
     if create_poster_form.images:
         images_stored = await store_images(create_poster_form.images)
     else:
         images_stored = []
-    poster_collection.insert_one(
-        {
-            "uid": open_id,
-            "title": create_poster_form.title,
-            "content": create_poster_form.content,
-            "timestamp": time.time(),
-            "images": images_stored,
-            "comments": [],
-        }
-    )
+    if (
+        await poster_collection.insert_one(
+            {
+                "uid": open_id,
+                "is_anon": create_poster_form.is_anonymous,
+                "title": create_poster_form.title,
+                "content": create_poster_form.content,
+                "timestamp": time.time(),
+                "images": images_stored,
+                "comments": [],
+            }
+        )
+    ).inserted_id is None:
+        return {"status": 2}
     return {"status": 0}
 
 
@@ -327,14 +360,14 @@ class DeleteTopicForm(BaseModel):
     pid: str
 
 
-@app.post("/deletetopic")
-def delete_topic(
+@app.post("/delete/topic")
+async def delete_topic(
     authentication: Annotated[str, Header()], delete_topic_form: DeleteTopicForm
 ):
-    res, open_id = authenticate(authentication, "strong")
+    res, open_id = await authenticate(authentication, "strong")
     if not res:
         return {"status": 1}
-    poster_document = poster_collection.find_one(
+    poster_document = await poster_collection.find_one(
         {"_id": ObjectId(delete_topic_form.pid)}
     )
     if not poster_document:
@@ -342,56 +375,58 @@ def delete_topic(
     if poster_document.get("uid") != open_id:
         return {"status": 3}
     if (
-        poster_collection.delete_one({"_id": poster_document.get("_id")}).deleted_count
-        != 1
-    ):
+        await poster_collection.delete_one({"_id": poster_document.get("_id")})
+    ).deleted_count != 1:
         return {"status": 4}
     return {"status": 0}
 
 
 @app.get("/topic/{page}")
-def get_topic(page: int):
+async def get_topic(page: int):
     topics = []
     for document in (
-        poster_collection.find({}, {"comments": 0})
+        await poster_collection.find({}, {"comments": 0})
         .skip(config.PAGE_SIZE * page)
         .limit(config.PAGE_SIZE)
     ):
-        user_document = user_collection.find_one(
-            {"_id": document.get("uid")}, {"avatar": 1, "name": 1}
-        )
-        topics.append(
-            {
-                "title": document.get("title"),
-                "content": document.get("content"),
-                "timestamp": datetime.fromtimestamp(document.get("timestamp")).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "images": document.get("images"),
-                "pid": str(document.get("_id")),
-                "avatar": user_document.get("avatar"),
-                "name": user_document.get("name"),
-            }
-        )
-
+        topic = {
+            "title": document.get("title"),
+            "content": document.get("content"),
+            "timestamp": datetime.fromtimestamp(document.get("timestamp")).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "images": document.get("images"),
+            "pid": str(document.get("_id")),
+        }
+        if document.get("is_anon"):
+            topic["is_anonymous"] = True
+        else:
+            topic["is_anonymous"] = False
+            user_document = await user_collection.find_one(
+                {"_id": document.get("uid")}, {"avatar": 1, "name": 1}
+            )
+            topic["avatar"] = user_document.get("avatar")
+            topic["name"] = user_document.get("name")
+        topics.append(topic)
     return {"status": 0, "topics": topics}
 
 
 class CreateCommentForm(BaseModel):
     content: str
+    is_anonymous: bool
     pid: str
     repeat_id: Optional[int] = None
     images: Optional[List[UploadFile]] = None
 
 
-@app.post("/comment")
+@app.post("/create/comment")
 async def create_comment(
     authentication: Annotated[str, Header()], create_comment_form: CreateCommentForm
 ):
-    res, open_id = authenticate(authentication, "strong")
+    res, open_id = await authenticate(authentication, "strong")
     if not res:
         return {"status": 1}
-    poster_document = poster_collection.find_one(
+    poster_document = await poster_collection.find_one(
         {"_id": ObjectId(create_comment_form.pid)}
     )
     if not poster_document:
@@ -399,6 +434,7 @@ async def create_comment(
     target = "comments"
     content = {
         "content": create_comment_form.content,
+        "is_anon": create_comment_form.is_anonymous,
         "timestamp": time.time(),
         "uid": open_id,
     }
@@ -412,9 +448,11 @@ async def create_comment(
         content["sub"] = []
 
     if (
-        not poster_collection.update_one(
-            {"_id": poster_document.get("_id")},
-            {"$push": {target: content}},
+        not (
+            await poster_collection.update_one(
+                {"_id": poster_document.get("_id")},
+                {"$push": {target: content}},
+            )
         ).modified_count
         != 1
     ):
@@ -428,14 +466,14 @@ class DeleteCommentForm(BaseModel):
     index2: Optional[int] = None
 
 
-@app.post("/deletecomment")
-def delete_comment(
+@app.post("/delete/comment")
+async def delete_comment(
     authentication: Annotated[str, Header()], delete_comment_form: DeleteCommentForm
 ):
-    res, open_id = authenticate(authentication, "strong")
+    res, open_id = await authenticate(authentication, "strong")
     if not res:
         return {"status": 1}
-    poster_document = poster_collection.find_one(
+    poster_document = await poster_collection.find_one(
         {"_id": ObjectId(delete_comment_form.pid)}, {"comments": 1}
     )
     if not poster_document:
@@ -457,9 +495,11 @@ def delete_comment(
     if delete_comment_form.index2 is not None:
         target = f"{target}.sub.{delete_comment_form.index2}"
     if (
-        not poster_collection.update_one(
-            {"_id": ObjectId(delete_comment_form.pid)},
-            {"$unset": {target: ""}},
+        not (
+            await poster_collection.update_one(
+                {"_id": ObjectId(delete_comment_form.pid)},
+                {"$unset": {target: ""}},
+            )
         ).modified_count
         != 1
     ):
@@ -468,8 +508,8 @@ def delete_comment(
 
 
 @app.get("/comment/{topic_id}")
-def get_comment(topic_id: str):
-    poster_document = poster_collection.find_one({"_id": ObjectId(topic_id)})
+async def get_comment(topic_id: str):
+    poster_document = await poster_collection.find_one({"_id": ObjectId(topic_id)})
     if not poster_document:
         return {"status": 1}
     return {"status": 0, "comments": poster_document.get("comments")}
@@ -487,18 +527,3 @@ async def routine(x_api_key: Annotated[str, Header()]):
         checkin_collection = db[f"checkin_collection{index}"]
 
     return {"status": 0}
-
-
-# @app.get("/")
-# def read_root():
-#     return {"Hello": "World"}
-
-
-# @app.get("/items/{item_id}")
-# def read_item(item_id: int, q: Union[str, None] = None):
-#     return {"item_id": item_id, "q": q}
-
-
-# @app.put("/items/{item_id}")
-# def update_item(item_id: int, item: Item):
-#     return {"item_name": item.price, "item_id": item_id}
