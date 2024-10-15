@@ -1,0 +1,7 @@
+aiofiles
+coloredlogs
+fastapi
+httpx
+motor
+pydantic
+uvicorn
