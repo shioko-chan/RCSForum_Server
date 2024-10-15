@@ -21,7 +21,6 @@ import uuid
 
 import config
 
-
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=logging.INFO, logger=logger)
 
@@ -34,7 +33,6 @@ poster_collection = db["poster"]
 user_collection = db["user"]
 
 checkin_collections = db["checkin_collections"]
-checkin_collections.insert_one({"index": 1})
 checkin_collection = db["checkin_collection_0"]
 checkin_collection_lock = asyncio.Lock()
 
@@ -96,19 +94,22 @@ async def update_app_access_token():
         return None
 
 
-async def renew_app_token():
+async def renew_app_token(ttl):
     while True:
-        ttl = await update_app_access_token()
         if ttl:
             await asyncio.sleep(ttl)
         else:
             await asyncio.sleep(60.0)
+        ttl = await update_app_access_token()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await create_index()
-    asyncio.create_task(renew_app_token())
+    if (await checkin_collections.find_one()) is None:
+        await checkin_collections.insert_one({"index": 1})
+    ttl = await update_app_access_token()
+    asyncio.create_task(renew_app_token(ttl=ttl))
     yield
 
 
@@ -116,24 +117,28 @@ app = FastAPI(lifespan=lifespan)
 
 
 @retry_with_limit(max_retry=3)
-async def limited_api_req(url, headers, json, method="POST"):
+async def limited_api_req(url, headers, json=None, method="POST"):
     async with httpx.AsyncClient() as client:
-        request = None
         match method:
             case "POST":
-                request = client.post
+                return await client.post(
+                    url=url,
+                    headers=headers,
+                    json=json,
+                )
             case "GET":
-                request = client.get
-        return await request(
-            url=url,
-            headers=headers,
-            json=json,
-        )
+                return await client.get(
+                    url=url,
+                    headers=headers,
+                )
 
 
-async def update_authorization(code):
+async def update_authentication(code):
     global app_access_token
     async with app_access_token_lock:
+        if app_access_token is None:
+            logger.error("App access token is not acquired.")
+            return None, -2
         try:
             resp = await limited_api_req(
                 url="https://open.feishu.cn/open-apis/authen/v1/oidc/access_token",
@@ -177,23 +182,24 @@ async def update_authorization(code):
         logger.error(f"An error occur while processing user info: {e}")
         return None, -1
     try:
-        cid = uuid.uuid4()
-        open_id = ObjectId(open_id)
-        user_document = await user_collection.find_one({"_id": id})
+        user_document = await user_collection.find_one({"_id": open_id})
+        if user_document and time.time() - user_document.get("time") < config.EXPIRE_DURATION:        
+            return (user_document.get("cid"), name, avatar), None          
+        cid = uuid.uuid4().hex
         info = {
             "cid": cid,
             "time": math.floor(time.time()),
             "avatar": avatar,
             "name": name,
         }
-        if not user_document:
-            info["_id"] = open_id
-            await user_collection.insert_one(info)
-        else:
+        if user_document:
             await user_collection.update_one(
                 {"_id": open_id},
                 {"$set": info},
             )
+        else:
+            info["_id"] = open_id
+            await user_collection.insert_one(info)
     except Exception as e:
         logger.error(f"An error occur while upserting user info : {e}")
         return None, -1
@@ -201,12 +207,11 @@ async def update_authorization(code):
 
 
 async def authenticate(user_token: str, magnitude="strong"):
-    user_token = uuid.UUID(hex=user_token)
     user_document = await user_collection.find_one(
         {"cid": user_token}, {"_id": 1, "time": 1}
     )
     if not user_document:
-        return False, None
+        return False, f"cid {user_token} NOT FOUND"
 
     expire_duration = None
     match magnitude:
@@ -218,7 +223,7 @@ async def authenticate(user_token: str, magnitude="strong"):
             raise ValueError(f"Magnitude {magnitude} is not defined")
 
     if time.time() - user_document.get("time") > expire_duration:
-        return False, None
+        return False, f"cid {user_token} EXPIRED"
 
     return True, user_document.get("_id")
 
@@ -229,7 +234,7 @@ class TempCodeForm(BaseModel):
 
 @app.post("/login")
 async def login(temp_code_form: TempCodeForm, response: Response):
-    val, err = await update_authorization(temp_code_form.code)
+    val, err = await update_authentication(temp_code_form.code)
     if err is not None:
         return {"status": err}
     cid, name, avatar = val
@@ -241,6 +246,7 @@ async def login(temp_code_form: TempCodeForm, response: Response):
 async def keep_alive(authentication: Annotated[str, Header()]):
     res, open_id = await authenticate(authentication, "weak")
     if not res:
+        logger.warning(f"An authentication failed, because of {open_id}")
         return {"status": 1}
     async with checkin_collection_lock:
         document = await checkin_collection.find_one({"_id": open_id})
@@ -312,7 +318,7 @@ async def store_images(image_list: List[UploadFile]):
                 ".tiff",
             ]:
                 continue
-            filename = f"{uuid.uuid4()}{suffix}"
+            filename = f"{uuid.uuid4().hex}{suffix}"
             path = Path(config.UPLOAD_FOLDER).joinpath(filename)
             async with aiofiles.open(path, "wb") as out_image:
                 await out_image.write(await image.read())
@@ -394,7 +400,7 @@ async def delete_topic(
 @app.get("/topic")
 async def get_topic(page: int):
     if page < 0:
-        return {"status": 1}
+        return {"status": 2}
     topics = []
     for document in (
         await poster_collection.find({}, {"comments": 0})
@@ -523,7 +529,7 @@ async def delete_comment(
 async def get_comment(topic_id: str):
     poster_document = await poster_collection.find_one({"_id": ObjectId(topic_id)})
     if not poster_document:
-        return {"status": 1}
+        return {"status": 2}
     return {"status": 0, "comments": poster_document.get("comments")}
 
 
