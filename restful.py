@@ -1,6 +1,6 @@
 from typing import Annotated, List, Optional
 from fastapi import FastAPI, Response, Header, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -35,11 +35,6 @@ user_collection = db["user"]
 checkin_collections = db["checkin_collections"]
 checkin_collection = db["checkin_collection_0"]
 checkin_collection_lock = asyncio.Lock()
-
-
-async def create_index():
-    res = await user_collection.create_index("cid")
-    logger.info(f"create index on user collection, index name: {res}")
 
 
 def retry_with_limit(max_retry=5):
@@ -105,7 +100,9 @@ async def renew_app_token(ttl):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await create_index()
+    logger.info(
+        f"create index on user collection, index name: {await user_collection.create_index("cid")}"
+    )
     if (await checkin_collections.find_one()) is None:
         await checkin_collections.insert_one({"index": 1})
     ttl = await update_app_access_token()
@@ -183,8 +180,11 @@ async def update_authentication(code):
         return None, -1
     try:
         user_document = await user_collection.find_one({"_id": open_id})
-        if user_document and time.time() - user_document.get("time") < config.EXPIRE_DURATION:        
-            return (user_document.get("cid"), name, avatar), None          
+        if (
+            user_document
+            and time.time() - user_document.get("time") < config.EXPIRE_DURATION
+        ):
+            return (user_document.get("cid"), name, avatar), None
         cid = uuid.uuid4().hex
         info = {
             "cid": cid,
@@ -286,7 +286,7 @@ async def hello(authentication: Annotated[str, Header()]):
 async def rank():
     rank_list = []
     async with checkin_collection_lock:
-        for mark in await checkin_collection.find({}, {"_id": 1, "time": 1}):
+        async for mark in checkin_collection.find({}, {"_id": 1, "time": 1}):
             open_id = mark.get("_id")
             user_document = await user_collection.find_one({"_id": open_id})
             if user_document:
@@ -361,6 +361,7 @@ async def create_topic(
                 "uid": open_id,
                 "is_anon": create_poster_form.is_anonymous,
                 "title": create_poster_form.title,
+                "likes": set(),
                 "content": create_poster_form.content,
                 "time": time.time(),
                 "images": images_stored,
@@ -369,6 +370,56 @@ async def create_topic(
         )
     ).inserted_id is None:
         return {"status": 2}
+    return {"status": 0}
+
+
+class LikeTopicForm(BaseModel):
+    pid: str
+
+
+@app.post("/like/topic")
+async def like_topic(
+    authentication: Annotated[str, Header()], like_topic_form: LikeTopicForm
+):
+    res, open_id = await authenticate(authentication, "weak")
+    if not res:
+        return {"status": 1}
+    poster_document = await poster_collection.find_one(
+        {"_id": ObjectId(like_topic_form.pid)}
+    )
+    if poster_document is None:
+        return {"status": 2}
+    if (
+        await poster_collection.update_one(
+            {"_id": ObjectId(like_topic_form.pid)}, {"$addToSet": {"likes": open_id}}
+        )
+    ).modified_count != 1:
+        return {"status": 3}
+    return {"status": 0}
+
+
+class UnlikeTopicForm(BaseModel):
+    pid: str
+
+
+@app.post("/unlike/topic")
+async def unlike_topic(
+    authentication: Annotated[str, Header()], unlike_topic_form: UnlikeTopicForm
+):
+    res, open_id = await authenticate(authentication, "weak")
+    if not res:
+        return {"status": 1}
+    poster_document = await poster_collection.find_one(
+        {"_id": ObjectId(unlike_topic_form.pid)}
+    )
+    if poster_document is None:
+        return {"status": 2}
+    if (
+        await poster_collection.update_one(
+            {"_id": ObjectId(unlike_topic_form.pid)}, {"$pull": {"likes": open_id}}
+        )
+    ).modified_count != 1:
+        return {"status": 3}
     return {"status": 0}
 
 
@@ -398,23 +449,29 @@ async def delete_topic(
 
 
 @app.get("/topic")
-async def get_topic(page: int):
+async def get_topic(authentication: Annotated[str, Header()], page: int):
+    res, open_id = await authenticate(authentication, "strong")
+    if not res:
+        return {"status": 1}
     if page < 0:
         return {"status": 2}
     topics = []
-    for document in (
-        await poster_collection.find({}, {"comments": 0})
+    async for document in (
+        poster_collection.find({}, {"comments": 0})
         .skip(config.PAGE_SIZE * page)
         .limit(config.PAGE_SIZE)
     ):
+        likes_set = document.get("likes")
         topic = {
+            "pid": str(document.get("_id")),
             "title": document.get("title"),
             "content": document.get("content"),
             "time": datetime.fromtimestamp(document.get("time")).strftime(
                 "%Y-%m-%d %H:%M:%S"
             ),
             "images": document.get("images"),
-            "pid": str(document.get("_id")),
+            "likes": len(likes_set),
+            "liked": open_id in likes_set,
         }
         if document.get("is_anon"):
             topic["is_anonymous"] = True
@@ -453,6 +510,7 @@ async def create_comment(
     content = {
         "content": create_comment_form.content,
         "is_anon": create_comment_form.is_anonymous,
+        "likes": set(),
         "time": time.time(),
         "uid": open_id,
     }
@@ -475,6 +533,68 @@ async def create_comment(
         != 1
     ):
         {"status": 3}
+    return {"status": 0}
+
+
+class LikeCommentForm(BaseModel):
+    pid: str
+    index1: int
+    index2: Optional[int] = None
+
+
+@app.post("/like/comment")
+async def like_comment(
+    authentication: Annotated[str, Header()], like_comment_form: LikeCommentForm
+):
+    res, open_id = await authenticate(authentication, "weak")
+    if not res:
+        return {"status": 1}
+    poster_document = await poster_collection.find_one(
+        {"_id": ObjectId(like_comment_form.pid)}
+    )
+    if poster_document is None:
+        return {"status": 2}
+    target = f"comments.{like_comment_form.index1}"
+    if like_comment_form.index2 is not None:
+        target = f"{target}.sub.{like_comment_form.index2}"
+    if (
+        await poster_collection.update_one(
+            {"_id": ObjectId(like_comment_form.pid)},
+            {"$addToSet": {f"{target}.likes": open_id}},
+        )
+    ).modified_count != 1:
+        return {"status": 3}
+    return {"status": 0}
+
+
+class UnlikeCommentForm(BaseModel):
+    pid: str
+    index1: int
+    index2: Optional[int] = None
+
+
+@app.post("/unlike/comment")
+async def unlike_topic(
+    authentication: Annotated[str, Header()], unlike_comment_form: UnlikeCommentForm
+):
+    res, open_id = await authenticate(authentication, "weak")
+    if not res:
+        return {"status": 1}
+    poster_document = await poster_collection.find_one(
+        {"_id": ObjectId(unlike_comment_form.pid)}
+    )
+    if poster_document is None:
+        return {"status": 2}
+    target = f"comments.{unlike_comment_form.index1}"
+    if unlike_comment_form.index2 is not None:
+        target = f"{target}.sub.{unlike_comment_form.index2}"
+    if (
+        await poster_collection.update_one(
+            {"_id": ObjectId(unlike_comment_form.pid)},
+            {"$pull": {f"{target}.likes": open_id}},
+        )
+    ).modified_count != 1:
+        return {"status": 3}
     return {"status": 0}
 
 
@@ -548,87 +668,23 @@ async def routine(x_api_key: Annotated[str, Header()]):
     return {"status": 0}
 
 
-# @app.get("/admin/users")
-# async def get_users(page: int):
-#     if page < 0:
-#         return {"status": 1}
-#     users = await user_collection.find({}, {"cid": 0, "time": 0}).skip(
-#         config.ADMIN_PAGE_SIZE * page
-#     )
-#     return {"status": 0, "users": users}
+@app.get("/authenticate")
+async def admin(authentication: Annotated[str, Header()]):
+    return HTMLResponse(
+        """
+        <html>
+            <head>
+                <title>Admin</title>
+            </head>
+            <body>
+                <h1>Admin</h1>
+                <p>Authentication:</p>
+            </body>
+        </html>
+        """
+    )
+    # res, openid = await authenticate(authentication, "strong")
+    # if not res:
+    #     return {"status": 1}
 
-
-# @app.put("/admin/user/{cid}")
-# async def update_user(cid: str, user_form: UserForm):
-#     result = await user_collection.update_one(
-#         {"cid": cid},
-#         {
-#             "$set": {
-#                 "name": user_form.name,
-#                 "avatar": user_form.avatar,
-#                 "is_admin": user_form.is_admin,
-#             }
-#         },
-#     )
-#     if result.modified_count == 0:
-#         return {"status": 1, "message": "User not found or no changes made."}
-#     return {"status": 0, "message": "User updated successfully."}
-
-
-# @app.delete("/admin/user/{cid}")
-# async def delete_user(cid: str):
-#     result = await user_collection.delete_one({"cid": cid})
-#     if result.deleted_count == 0:
-#         return {"status": 1, "message": "User not found."}
-#     return {"status": 0, "message": "User deleted successfully."}
-
-
-# @app.get("/admin/posts")
-# async def get_posts():
-#     posts = await poster_collection.find().to_list(100)  # Adjust limit as needed
-#     return {"status": 0, "posts": posts}
-
-
-# @app.delete("/admin/post/{pid}")
-# async def delete_post(pid: str):
-#     result = await poster_collection.delete_one({"_id": ObjectId(pid)})
-#     if result.deleted_count == 0:
-#         return {"status": 1, "message": "Post not found."}
-#     return {"status": 0, "message": "Post deleted successfully."}
-
-
-# @app.get("/admin/comments/{post_id}")
-# async def get_comments(post_id: str):
-#     post_document = await poster_collection.find_one({"_id": ObjectId(post_id)})
-#     if not post_document:
-#         return {"status": 1, "message": "Post not found."}
-
-#     return {"status": 0, "comments": post_document.get("comments", [])}
-
-
-# @app.delete("/admin/comment/{post_id}/{comment_index}")
-# async def delete_comment(post_id: str, comment_index: int):
-#     post_document = await poster_collection.find_one({"_id": ObjectId(post_id)})
-#     if not post_document or comment_index >= len(post_document.get("comments", [])):
-#         return {"status": 1, "message": "Comment not found."}
-
-#     comment_uid = post_document["comments"][comment_index]["uid"]
-
-#     # Ensure the comment is only deleted if it's by the user or the admin
-#     if comment_uid == open_id or user_is_admin(
-#         open_id
-#     ):  # Assuming user_is_admin is a function you create to check admin status
-#         result = await poster_collection.update_one(
-#             {"_id": ObjectId(post_id)}, {"$unset": {f"comments.{comment_index}": ""}}
-#         )
-#         if result.modified_count == 0:
-#             return {"status": 2, "message": "Failed to delete comment."}
-#         return {"status": 0, "message": "Comment deleted successfully."}
-
-#     return {"status": 3, "message": "Unauthorized to delete this comment."}
-
-
-# @app.get("/admin/checkin")
-# async def get_checkin_records():
-#     records = await checkin_collection.find().to_list(100)  # Adjust limit as needed
-#     return {"status": 0, "records": records}
+    # return {"status": 0}
