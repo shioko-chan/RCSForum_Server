@@ -34,8 +34,8 @@ poster_collection = db["poster"]
 user_collection = db["user"]
 
 checkin_collections = db["checkin_collections"]
-checkin_collections.insert_one({"index": 0})
-checkin_collection = db["checkin_collection"]
+checkin_collections.insert_one({"index": 1})
+checkin_collection = db["checkin_collection_0"]
 checkin_collection_lock = asyncio.Lock()
 
 
@@ -134,69 +134,70 @@ async def limited_api_req(url, headers, json, method="POST"):
 async def update_authorization(code):
     global app_access_token
     async with app_access_token_lock:
-        resp = await limited_api_req(
-            url="https://open.feishu.cn/open-apis/authen/v1/oidc/access_token",
-            headers={
-                "Authorization": app_access_token,
-                "Content-Type": "application/json; charset=utf-8",
-            },
-            json={
-                "grant_type": "authorization_code",
-                "code": code,
-            },
-            method="POST",
-        )
-
-        body = resp.json()
-        if not (resp.status_code == 200 and body["code"] == 0):
-            logger.error(f"Failed to get user access token, resp: {resp.text}")
-            return None, 1
-
-        user_access_token = f"Bearer {body["data"]["access_token"]}"
-
-        resp = await limited_api_req(
-            url="https://open.feishu.cn/open-apis/authen/v1/user_info",
-            headers={
-                "Authorization": user_access_token,
-            },
-            method="GET",
-        )
-
+        try:
+            resp = await limited_api_req(
+                url="https://open.feishu.cn/open-apis/authen/v1/oidc/access_token",
+                headers={
+                    "Authorization": app_access_token,
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                },
+                method="POST",
+            )
+            body = resp.json()
+            if not (resp.status_code == 200 and body["code"] == 0):
+                logger.error(f"Failed to get user access token, resp: {resp.text}")
+                return None, 1
+            user_access_token = f"Bearer {body['data']['access_token']}"
+        except Exception as e:
+            logger.error(f"An error occur while fetching user access token: {e}")
+            return None, -1
+        try:
+            resp = await limited_api_req(
+                url="https://open.feishu.cn/open-apis/authen/v1/user_info",
+                headers={
+                    "Authorization": user_access_token,
+                },
+                method="GET",
+            )
+        except Exception as e:
+            logger.error(f"An error occur while fetching user info: {e}")
+            return None, -1
+    try:
         body = resp.json()
         if not (resp.status_code == 200 and body["code"] == 0):
             logger.error(f"Failed to get user info, resp: {resp.text}")
             return None, 2
-
         data = body["data"]
         name, avatar, open_id = data["name"], data["avatar_url"], data["open_id"]
-
+    except Exception as e:
+        logger.error(f"An error occur while processing user info: {e}")
+        return None, -1
+    try:
         cid = uuid.uuid4()
-        id = ObjectId(open_id)
-        current_user = await user_collection.find_one({"_id": id})
-
-        if not current_user:
-            await user_collection.insert_one(
-                {
-                    "_id": id,
-                    "cid": cid,
-                    "time": math.floor(time.time()),
-                    "avatar": avatar,
-                    "name": name,
-                }
-            )
+        open_id = ObjectId(open_id)
+        user_document = await user_collection.find_one({"_id": id})
+        info = {
+            "cid": cid,
+            "time": math.floor(time.time()),
+            "avatar": avatar,
+            "name": name,
+        }
+        if not user_document:
+            info["_id"] = open_id
+            await user_collection.insert_one(info)
         else:
             await user_collection.update_one(
-                {"_id": id},
-                {
-                    "$set": {
-                        "cid": cid,
-                        "time": math.floor(time.time()),
-                        "avatar": avatar,
-                        "name": name,
-                    }
-                },
+                {"_id": open_id},
+                {"$set": info},
             )
-        return (cid, name, avatar), None
+    except Exception as e:
+        logger.error(f"An error occur while upserting user info : {e}")
+        return None, -1
+    return (cid, name, avatar), None
 
 
 async def authenticate(user_token: str, magnitude="strong"):
@@ -279,7 +280,7 @@ async def hello(authentication: Annotated[str, Header()]):
 async def rank():
     rank_list = []
     async with checkin_collection_lock:
-        for mark in await checkin_collection.find():
+        for mark in await checkin_collection.find({}, {"_id": 1, "time": 1}):
             open_id = mark.get("_id")
             user_document = await user_collection.find_one({"_id": open_id})
             if user_document:
@@ -295,30 +296,39 @@ async def rank():
 
 async def store_images(image_list: List[UploadFile]):
     images_stored = []
-    for image in image_list:
-        if not image.content_type.startswith("image/"):
-            continue
-        suffix = Path(image.filename).suffix
-        if suffix not in [
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".bmp",
-            ".gif",
-            ".tiff",
-        ]:
-            continue
-        filename = f"{uuid.uuid4()}{suffix}"
-        path = Path(config.UPLOAD_FOLDER).joinpath(filename)
-        async with aiofiles.open(path, "wb") as out_image:
-            await out_image.write(await image.read())
-        images_stored.append(filename)
+    try:
+        for image in image_list:
+            if image is None:
+                continue
+            if not image.content_type.startswith("image/"):
+                continue
+            suffix = Path(image.filename).suffix
+            if suffix not in [
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".bmp",
+                ".gif",
+                ".tiff",
+            ]:
+                continue
+            filename = f"{uuid.uuid4()}{suffix}"
+            path = Path(config.UPLOAD_FOLDER).joinpath(filename)
+            async with aiofiles.open(path, "wb") as out_image:
+                await out_image.write(await image.read())
+            images_stored.append(filename)
+    except Exception as e:
+        logger.error(f"An error occurred while storing image, {e}")
     return images_stored
 
 
 @app.get("/image/{filename}")
 def get_image(filename: str):
-    return FileResponse(Path(config.UPLOAD_FOLDER).joinpath(filename))
+    path = Path(config.UPLOAD_FOLDER).joinpath(filename)
+    if path.exists():
+        return FileResponse(path=path)
+    else:
+        return Response(status_code=404)
 
 
 class CreatePosterForm(BaseModel):
@@ -346,7 +356,7 @@ async def create_topic(
                 "is_anon": create_poster_form.is_anonymous,
                 "title": create_poster_form.title,
                 "content": create_poster_form.content,
-                "timestamp": time.time(),
+                "time": time.time(),
                 "images": images_stored,
                 "comments": [],
             }
@@ -381,8 +391,10 @@ async def delete_topic(
     return {"status": 0}
 
 
-@app.get("/topic/{page}")
+@app.get("/topic")
 async def get_topic(page: int):
+    if page < 0:
+        return {"status": 1}
     topics = []
     for document in (
         await poster_collection.find({}, {"comments": 0})
@@ -392,7 +404,7 @@ async def get_topic(page: int):
         topic = {
             "title": document.get("title"),
             "content": document.get("content"),
-            "timestamp": datetime.fromtimestamp(document.get("timestamp")).strftime(
+            "time": datetime.fromtimestamp(document.get("time")).strftime(
                 "%Y-%m-%d %H:%M:%S"
             ),
             "images": document.get("images"),
@@ -435,7 +447,7 @@ async def create_comment(
     content = {
         "content": create_comment_form.content,
         "is_anon": create_comment_form.is_anonymous,
-        "timestamp": time.time(),
+        "time": time.time(),
         "uid": open_id,
     }
     if create_comment_form.repeat_id is not None:
@@ -520,10 +532,97 @@ async def routine(x_api_key: Annotated[str, Header()]):
     if x_api_key != config.X_API_KEY:
         return {"status": 1}
 
-    index = checkin_collections.find_one().get("index")
-    checkin_collections.update_one({}, {"$inc": {"index": 1}})
+    index = (
+        await checkin_collections.find_one_and_update({}, {"$inc": {"index": 1}})
+    ).get("index")
     global checkin_collection
     async with checkin_collection_lock:
-        checkin_collection = db[f"checkin_collection{index}"]
+        checkin_collection = db[f"checkin_collection_{index}"]
 
     return {"status": 0}
+
+
+# @app.get("/admin/users")
+# async def get_users(page: int):
+#     if page < 0:
+#         return {"status": 1}
+#     users = await user_collection.find({}, {"cid": 0, "time": 0}).skip(
+#         config.ADMIN_PAGE_SIZE * page
+#     )
+#     return {"status": 0, "users": users}
+
+
+# @app.put("/admin/user/{cid}")
+# async def update_user(cid: str, user_form: UserForm):
+#     result = await user_collection.update_one(
+#         {"cid": cid},
+#         {
+#             "$set": {
+#                 "name": user_form.name,
+#                 "avatar": user_form.avatar,
+#                 "is_admin": user_form.is_admin,
+#             }
+#         },
+#     )
+#     if result.modified_count == 0:
+#         return {"status": 1, "message": "User not found or no changes made."}
+#     return {"status": 0, "message": "User updated successfully."}
+
+
+# @app.delete("/admin/user/{cid}")
+# async def delete_user(cid: str):
+#     result = await user_collection.delete_one({"cid": cid})
+#     if result.deleted_count == 0:
+#         return {"status": 1, "message": "User not found."}
+#     return {"status": 0, "message": "User deleted successfully."}
+
+
+# @app.get("/admin/posts")
+# async def get_posts():
+#     posts = await poster_collection.find().to_list(100)  # Adjust limit as needed
+#     return {"status": 0, "posts": posts}
+
+
+# @app.delete("/admin/post/{pid}")
+# async def delete_post(pid: str):
+#     result = await poster_collection.delete_one({"_id": ObjectId(pid)})
+#     if result.deleted_count == 0:
+#         return {"status": 1, "message": "Post not found."}
+#     return {"status": 0, "message": "Post deleted successfully."}
+
+
+# @app.get("/admin/comments/{post_id}")
+# async def get_comments(post_id: str):
+#     post_document = await poster_collection.find_one({"_id": ObjectId(post_id)})
+#     if not post_document:
+#         return {"status": 1, "message": "Post not found."}
+
+#     return {"status": 0, "comments": post_document.get("comments", [])}
+
+
+# @app.delete("/admin/comment/{post_id}/{comment_index}")
+# async def delete_comment(post_id: str, comment_index: int):
+#     post_document = await poster_collection.find_one({"_id": ObjectId(post_id)})
+#     if not post_document or comment_index >= len(post_document.get("comments", [])):
+#         return {"status": 1, "message": "Comment not found."}
+
+#     comment_uid = post_document["comments"][comment_index]["uid"]
+
+#     # Ensure the comment is only deleted if it's by the user or the admin
+#     if comment_uid == open_id or user_is_admin(
+#         open_id
+#     ):  # Assuming user_is_admin is a function you create to check admin status
+#         result = await poster_collection.update_one(
+#             {"_id": ObjectId(post_id)}, {"$unset": {f"comments.{comment_index}": ""}}
+#         )
+#         if result.modified_count == 0:
+#             return {"status": 2, "message": "Failed to delete comment."}
+#         return {"status": 0, "message": "Comment deleted successfully."}
+
+#     return {"status": 3, "message": "Unauthorized to delete this comment."}
+
+
+# @app.get("/admin/checkin")
+# async def get_checkin_records():
+#     records = await checkin_collection.find().to_list(100)  # Adjust limit as needed
+#     return {"status": 0, "records": records}
