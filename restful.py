@@ -226,7 +226,13 @@ async def update_authentication(code):
             user_document
             and time.time() - user_document.get("time") < config.EXPIRE_DURATION
         ):
-            return (user_document.get("cid"), name, avatar), None
+            return (
+                user_document.get("cid"),
+                name,
+                avatar,
+                (await admin_collection.find_one({"_id": open_id}, {"_id": 1}))
+                is not None,
+            ), None
         cid = uuid.uuid4().hex
         info = {
             "cid": cid,
@@ -245,7 +251,12 @@ async def update_authentication(code):
     except Exception as e:
         logger.error(f"An error occur while upserting user info : {e}")
         return None, -1
-    return (cid, name, avatar), None
+    return (
+        cid,
+        name,
+        avatar,
+        (await admin_collection.find_one({"_id": open_id}, {"_id": 1})) is not None,
+    ), None
 
 
 @app.get("/user/{uid}")
@@ -298,9 +309,9 @@ async def login(temp_code_form: TempCodeForm, response: Response):
     val, err = await update_authentication(temp_code_form.code)
     if err is not None:
         return JSONResponse(content={"status": err}, status_code=406)
-    cid, name, avatar = val
+    cid, name, avatar, is_admin = val
     response.headers["Authorization"] = cid
-    return {"status": 0, "name": name, "avatar": avatar}
+    return {"status": 0, "name": name, "avatar": avatar, "is_admin": is_admin}
 
 
 @app.post("/checkin/keepalive")
@@ -363,8 +374,7 @@ async def rank():
 
 @app.get("/image/{filename}")
 async def get_image(filename: str, response: Response):
-    # response.headers["Cache-Control"] = "public, max-age=31536000"
-    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Cache-Control"] = "public, max-age=31536000"
     path = Path(config.UPLOAD_FOLDER).joinpath(filename)
     if path.exists():
         return FileResponse(path=path)
