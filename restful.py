@@ -1,16 +1,20 @@
 from typing import Annotated, List, Optional
 from fastapi import FastAPI, Response, Header, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
+
+import imagehash
 
 import coloredlogs
 
 import httpx
 import aiofiles
 
+from PIL import Image
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 import asyncio
@@ -35,6 +39,8 @@ user_collection = db["user"]
 checkin_collections = db["checkin_collections"]
 checkin_collection = db["checkin_collection_0"]
 checkin_collection_lock = asyncio.Lock()
+
+Path(config.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
 
 
 def retry_with_limit(max_retry=5):
@@ -236,18 +242,18 @@ class TempCodeForm(BaseModel):
 async def login(temp_code_form: TempCodeForm, response: Response):
     val, err = await update_authentication(temp_code_form.code)
     if err is not None:
-        return {"status": err}
+        return JSONResponse(content={"status": err}, status_code=406)
     cid, name, avatar = val
     response.headers["Authorization"] = cid
     return {"status": 0, "name": name, "avatar": avatar}
 
 
-@app.get("/checkin/keepalive")
+@app.post("/checkin/keepalive")
 async def keep_alive(authentication: Annotated[str, Header()]):
     res, open_id = await authenticate(authentication, "weak")
     if not res:
         logger.warning(f"An authentication failed, because of {open_id}")
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     async with checkin_collection_lock:
         document = await checkin_collection.find_one({"_id": open_id})
         if document:
@@ -256,29 +262,29 @@ async def keep_alive(authentication: Annotated[str, Header()]):
                     {"_id": open_id}, {"$inc": {"time": config.KEEP_ALIVE_INTERVAL}}
                 )
             ).modified_count != 1:
-                return {"status": 2}
+                return JSONResponse(content={"status": 2}, status_code=500)
         else:
             if (
                 await checkin_collection.insert_one(
                     {"_id": open_id, "time": config.KEEP_ALIVE_INTERVAL}
                 )
             ).inserted_id is None:
-                return {"status": 3}
+                return JSONResponse(content={"status": 3}, status_code=500)
     return {"status": 0}
 
 
-@app.get("/checkin/hello")
+@app.post("/checkin/hello")
 async def hello(authentication: Annotated[str, Header()]):
     res, open_id = await authenticate(authentication, "strong")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     async with checkin_collection_lock:
         document = await checkin_collection.find_one({"_id": open_id})
         if not document:
             if (
                 await checkin_collection.insert_one({"_id": open_id, "time": 0})
             ).inserted_id is None:
-                return {"status": 2}
+                return JSONResponse(content={"status": 2}, status_code=500)
     return {"status": 0}
 
 
@@ -300,36 +306,9 @@ async def rank():
     return {"status": 0, "rank": rank_list}
 
 
-async def store_images(image_list: List[UploadFile]):
-    images_stored = []
-    try:
-        for image in image_list:
-            if image is None:
-                continue
-            if not image.content_type.startswith("image/"):
-                continue
-            suffix = Path(image.filename).suffix
-            if suffix not in [
-                ".jpg",
-                ".jpeg",
-                ".png",
-                ".bmp",
-                ".gif",
-                ".tiff",
-            ]:
-                continue
-            filename = f"{uuid.uuid4().hex}{suffix}"
-            path = Path(config.UPLOAD_FOLDER).joinpath(filename)
-            async with aiofiles.open(path, "wb") as out_image:
-                await out_image.write(await image.read())
-            images_stored.append(filename)
-    except Exception as e:
-        logger.error(f"An error occurred while storing image, {e}")
-    return images_stored
-
-
 @app.get("/image/{filename}")
-def get_image(filename: str):
+async def get_image(filename: str, response: Response):
+    response.headers["Cache-Control"] = "public, max-age=31536000"
     path = Path(config.UPLOAD_FOLDER).joinpath(filename)
     if path.exists():
         return FileResponse(path=path)
@@ -337,11 +316,54 @@ def get_image(filename: str):
         return Response(status_code=404)
 
 
+def generate_phash(content: bytes) -> str:
+    image = Image.open(BytesIO(content))
+    phash_value = imagehash.phash(image)
+    return str(phash_value)
+
+
+@app.post("/image/upload")
+async def upload_image(authentication: Annotated[str, Header()], image: UploadFile):
+    res, _ = await authenticate(authentication, "weak")
+    if not res:
+        return Response(status_code=401)
+
+    if not image.content_type.startswith("image/"):
+        return Response(status_code=415)
+
+    suffix = Path(image.filename).suffix
+    if suffix not in [
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".gif",
+    ]:
+        return Response(status_code=415)
+
+    if image.size > config.MAX_IMAGE_SIZE:
+        return Response(status_code=406)
+
+    content = await image.read()
+    hash_hex = await asyncio.to_thread(generate_phash, content)
+    filename = f"{hash_hex}{suffix}"
+    path = Path(config.UPLOAD_FOLDER).joinpath(filename)
+    if path.exists():
+        return filename
+    try:
+        async with aiofiles.open(path, "wb") as out_image:
+            await out_image.write(content)
+    except Exception as e:
+        logger.error(f"An error occurred while storing image, {e}")
+        return Response(status_code=500)
+    return filename
+
+
 class CreatePosterForm(BaseModel):
     title: str
     content: str
     is_anonymous: bool
-    images: Optional[List[UploadFile]]
+    images: List[str]
 
 
 @app.post("/create/topic")
@@ -350,18 +372,15 @@ async def create_topic(
 ):
     res, open_id = await authenticate(authentication, "strong")
     if not res:
-        return {"status": 1}
-    if create_poster_form.images:
-        images_stored = await store_images(create_poster_form.images)
-    else:
-        images_stored = []
+        return JSONResponse(content={"status": 1}, status_code=401)
+    images_stored = create_poster_form.images
     if (
         await poster_collection.insert_one(
             {
                 "uid": open_id,
-                "is_anon": create_poster_form.is_anonymous,
+                "is_anonymous": create_poster_form.is_anonymous,
                 "title": create_poster_form.title,
-                "likes": set(),
+                "likes": [],
                 "content": create_poster_form.content,
                 "time": time.time(),
                 "images": images_stored,
@@ -369,7 +388,7 @@ async def create_topic(
             }
         )
     ).inserted_id is None:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=500)
     return {"status": 0}
 
 
@@ -383,18 +402,18 @@ async def like_topic(
 ):
     res, open_id = await authenticate(authentication, "weak")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     poster_document = await poster_collection.find_one(
         {"_id": ObjectId(like_topic_form.pid)}
     )
     if poster_document is None:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=406)
     if (
         await poster_collection.update_one(
             {"_id": ObjectId(like_topic_form.pid)}, {"$addToSet": {"likes": open_id}}
         )
     ).modified_count != 1:
-        return {"status": 3}
+        return JSONResponse(content={"status": 3}, status_code=500)
     return {"status": 0}
 
 
@@ -408,18 +427,18 @@ async def unlike_topic(
 ):
     res, open_id = await authenticate(authentication, "weak")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     poster_document = await poster_collection.find_one(
         {"_id": ObjectId(unlike_topic_form.pid)}
     )
     if poster_document is None:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=406)
     if (
         await poster_collection.update_one(
             {"_id": ObjectId(unlike_topic_form.pid)}, {"$pull": {"likes": open_id}}
         )
     ).modified_count != 1:
-        return {"status": 3}
+        return JSONResponse(content={"status": 3}, status_code=500)
     return {"status": 0}
 
 
@@ -433,18 +452,18 @@ async def delete_topic(
 ):
     res, open_id = await authenticate(authentication, "strong")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     poster_document = await poster_collection.find_one(
         {"_id": ObjectId(delete_topic_form.pid)}
     )
     if not poster_document:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=406)
     if poster_document.get("uid") != open_id:
-        return {"status": 3}
+        return JSONResponse(content={"status": 3}, status_code=403)
     if (
         await poster_collection.delete_one({"_id": poster_document.get("_id")})
     ).deleted_count != 1:
-        return {"status": 4}
+        return JSONResponse(content={"status": 4}, status_code=500)
     return {"status": 0}
 
 
@@ -452,16 +471,17 @@ async def delete_topic(
 async def get_topic(authentication: Annotated[str, Header()], page: int):
     res, open_id = await authenticate(authentication, "strong")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     if page < 0:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=406)
     topics = []
     async for document in (
         poster_collection.find({}, {"comments": 0})
+        .sort("time", -1)
         .skip(config.PAGE_SIZE * page)
         .limit(config.PAGE_SIZE)
     ):
-        likes_set = document.get("likes")
+        likes_list = document.get("likes")
         topic = {
             "pid": str(document.get("_id")),
             "title": document.get("title"),
@@ -470,10 +490,10 @@ async def get_topic(authentication: Annotated[str, Header()], page: int):
                 "%Y-%m-%d %H:%M:%S"
             ),
             "images": document.get("images"),
-            "likes": len(likes_set),
-            "liked": open_id in likes_set,
+            "likes": len(likes_list),
+            "liked": open_id in likes_list,
         }
-        if document.get("is_anon"):
+        if document.get("is_anonymous"):
             topic["is_anonymous"] = True
         else:
             topic["is_anonymous"] = False
@@ -483,6 +503,7 @@ async def get_topic(authentication: Annotated[str, Header()], page: int):
             topic["avatar"] = user_document.get("avatar")
             topic["name"] = user_document.get("name")
         topics.append(topic)
+    print(topics)
     return {"status": 0, "topics": topics}
 
 
@@ -490,8 +511,8 @@ class CreateCommentForm(BaseModel):
     content: str
     is_anonymous: bool
     pid: str
+    images: List[str]
     repeat_id: Optional[int] = None
-    images: Optional[List[UploadFile]] = None
 
 
 @app.post("/create/comment")
@@ -500,27 +521,24 @@ async def create_comment(
 ):
     res, open_id = await authenticate(authentication, "strong")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     poster_document = await poster_collection.find_one(
         {"_id": ObjectId(create_comment_form.pid)}
     )
     if not poster_document:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=406)
     target = "comments"
     content = {
         "content": create_comment_form.content,
-        "is_anon": create_comment_form.is_anonymous,
-        "likes": set(),
+        "is_anonymous": create_comment_form.is_anonymous,
+        "likes": [],
         "time": time.time(),
         "uid": open_id,
     }
     if create_comment_form.repeat_id is not None:
         target = f"{target}.{create_comment_form.repeat_id}.sub"
     else:
-        if create_comment_form.images:
-            content["images"] = await store_images(create_comment_form.images)
-        else:
-            content["images"] = []
+        content["images"] = create_comment_form.images
         content["sub"] = []
 
     if (
@@ -548,12 +566,12 @@ async def like_comment(
 ):
     res, open_id = await authenticate(authentication, "weak")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     poster_document = await poster_collection.find_one(
         {"_id": ObjectId(like_comment_form.pid)}
     )
     if poster_document is None:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=406)
     target = f"comments.{like_comment_form.index1}"
     if like_comment_form.index2 is not None:
         target = f"{target}.sub.{like_comment_form.index2}"
@@ -563,7 +581,7 @@ async def like_comment(
             {"$addToSet": {f"{target}.likes": open_id}},
         )
     ).modified_count != 1:
-        return {"status": 3}
+        return JSONResponse(content={"status": 3}, status_code=500)
     return {"status": 0}
 
 
@@ -579,12 +597,12 @@ async def unlike_topic(
 ):
     res, open_id = await authenticate(authentication, "weak")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     poster_document = await poster_collection.find_one(
         {"_id": ObjectId(unlike_comment_form.pid)}
     )
     if poster_document is None:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=406)
     target = f"comments.{unlike_comment_form.index1}"
     if unlike_comment_form.index2 is not None:
         target = f"{target}.sub.{unlike_comment_form.index2}"
@@ -594,7 +612,7 @@ async def unlike_topic(
             {"$pull": {f"{target}.likes": open_id}},
         )
     ).modified_count != 1:
-        return {"status": 3}
+        return JSONResponse(content={"status": 3}, status_code=500)
     return {"status": 0}
 
 
@@ -610,25 +628,25 @@ async def delete_comment(
 ):
     res, open_id = await authenticate(authentication, "strong")
     if not res:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
     poster_document = await poster_collection.find_one(
         {"_id": ObjectId(delete_comment_form.pid)}, {"comments": 1}
     )
     if not poster_document:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=406)
     comments = poster_document.get("comments")
     if not comments:
-        return {"status": 3}
+        return JSONResponse(content={"status": 3}, status_code=406)
     if delete_comment_form.index1 >= len(comments):
-        return {"status": 4}
+        return JSONResponse(content={"status": 4}, status_code=406)
     comment = comments[delete_comment_form.index1]
     if delete_comment_form.index2 is not None:
         comments = comment.get("sub")
         if delete_comment_form.index2 >= len(comments):
-            return {"status": 5}
+            return JSONResponse(content={"status": 5}, status_code=406)
         comment = comments[delete_comment_form.index2]
     if comment.get("uid") != open_id:
-        return {"status": 6}
+        return JSONResponse(content={"status": 6}, status_code=403)
     target = f"comments.{delete_comment_form.index1}"
     if delete_comment_form.index2 is not None:
         target = f"{target}.sub.{delete_comment_form.index2}"
@@ -641,7 +659,7 @@ async def delete_comment(
         ).modified_count
         != 1
     ):
-        return {"status": 7}
+        return JSONResponse(content={"status": 2}, status_code=500)
     return {"status": 0}
 
 
@@ -649,14 +667,14 @@ async def delete_comment(
 async def get_comment(topic_id: str):
     poster_document = await poster_collection.find_one({"_id": ObjectId(topic_id)})
     if not poster_document:
-        return {"status": 2}
+        return JSONResponse(content={"status": 2}, status_code=404)
     return {"status": 0, "comments": poster_document.get("comments")}
 
 
 @app.post("/routine")
 async def routine(x_api_key: Annotated[str, Header()]):
     if x_api_key != config.X_API_KEY:
-        return {"status": 1}
+        return JSONResponse(content={"status": 1}, status_code=401)
 
     index = (
         await checkin_collections.find_one_and_update({}, {"$inc": {"index": 1}})
@@ -685,6 +703,6 @@ async def admin(authentication: Annotated[str, Header()]):
     )
     # res, openid = await authenticate(authentication, "strong")
     # if not res:
-    #     return {"status": 1}
+    #     return JSONResponse(content={"status": 1}, status_code=401)
 
     # return {"status": 0}
