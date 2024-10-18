@@ -130,6 +130,10 @@ async def lifespan(app: FastAPI):
     yield
 
 
+async def check_if_admin(open_id):
+    return (await admin_collection.find_one({"_id": open_id}, {"_id": 1})) is not None
+
+
 app = FastAPI(lifespan=lifespan)
 
 
@@ -230,8 +234,7 @@ async def update_authentication(code):
                 user_document.get("cid"),
                 name,
                 avatar,
-                (await admin_collection.find_one({"_id": open_id}, {"_id": 1}))
-                is not None,
+                await check_if_admin(open_id),
             ), None
         cid = uuid.uuid4().hex
         info = {
@@ -255,7 +258,7 @@ async def update_authentication(code):
         cid,
         name,
         avatar,
-        (await admin_collection.find_one({"_id": open_id}, {"_id": 1})) is not None,
+        await check_if_admin(open_id),
     ), None
 
 
@@ -271,9 +274,7 @@ async def user_info(authentication: Annotated[str, Header()], uid: str):
     if not user_document:
         return JSONResponse(content={"status": 2}, status_code=404)
 
-    is_admin = (
-        await admin_collection.find_one({"_id": open_id}, {"_id": 1})
-    ) is not None
+    is_admin = await check_if_admin(open_id)
     topics = []
     async for document in poster_collection.find({"uid": uid}, {"comments": 0}):
         if not is_admin and document.get("is_anonymous"):
@@ -520,10 +521,7 @@ async def delete_topic(
     if not poster_document:
         return JSONResponse(content={"status": 2}, status_code=406)
 
-    if (
-        poster_document.get("uid") != open_id
-        and (await admin_collection.find_one({"_id": open_id}, {"_id": 1})) is None
-    ):
+    if poster_document.get("uid") != open_id and await check_if_admin(open_id):
         return JSONResponse(content={"status": 3}, status_code=403)
 
     if (
@@ -542,6 +540,8 @@ async def get_topic(authentication: Annotated[str, Header()], page: int):
     if page < 0:
         return JSONResponse(content={"status": 2}, status_code=406)
     topics = []
+
+    is_admin = await check_if_admin(open_id)
     async for document in (
         poster_collection.find({}, {"comments": 0})
         .sort("time", -1)
@@ -549,6 +549,7 @@ async def get_topic(authentication: Annotated[str, Header()], page: int):
         .limit(config.PAGE_SIZE)
     ):
         likes_list = document.get("likes")
+
         topic = {
             "pid": str(document.get("_id")),
             "title": document.get("title"),
@@ -560,16 +561,22 @@ async def get_topic(authentication: Annotated[str, Header()], page: int):
             "likes": len(likes_list),
             "liked": open_id in likes_list,
         }
+
         if document.get("is_anonymous"):
             topic["is_anonymous"] = True
+            if is_admin:
+                topic["uid"] = document.get("uid")
         else:
             topic["is_anonymous"] = False
+            topic["uid"] = document.get("uid")
             user_document = await user_collection.find_one(
                 {"_id": document.get("uid")}, {"avatar": 1, "name": 1}
             )
             topic["avatar"] = user_document.get("avatar")
             topic["name"] = user_document.get("name")
+
         topics.append(topic)
+
     return {"status": 0, "topics": topics}
 
 
@@ -690,10 +697,7 @@ async def delete_comment(
             return JSONResponse(content={"status": 5}, status_code=406)
         comment = comments[delete_comment_form.index2]
 
-    if (
-        comment.get("uid") != open_id
-        and (await admin_collection.find_one({"_id": open_id}, {"_id": 1})) is None
-    ):
+    if comment.get("uid") != open_id and await check_if_admin(open_id):
         return JSONResponse(content={"status": 3}, status_code=403)
 
     target = f"comments.{delete_comment_form.index1}"
@@ -714,12 +718,70 @@ async def delete_comment(
     return {"status": 0}
 
 
-@app.get("/comment/{topic_id}")
-async def get_comment(topic_id: str):
-    poster_document = await poster_collection.find_one({"_id": ObjectId(topic_id)})
+@app.get("/comment/{pid}")
+async def get_comment(authentication: Annotated[str, Header()], pid: str):
+    res, open_id = await authenticate(authentication, "weak")
+    if not res:
+        return JSONResponse(content={"status": 1}, status_code=401)
+
+    poster_document = await poster_collection.find_one(
+        {"_id": ObjectId(pid)}, {"comments": 1}
+    )
     if not poster_document:
         return JSONResponse(content={"status": 2}, status_code=404)
-    return {"status": 0, "comments": poster_document.get("comments")}
+
+    comments_raw = poster_document.get("comments")
+    comments = []
+    is_admin = await check_if_admin(open_id)
+    for comment_raw in comments_raw:
+        comment = {
+            "content": comment_raw.get("content"),
+            "time": datetime.fromtimestamp(comment_raw.get("time")).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "images": comment_raw.get("images"),
+            "subs": [],
+        }
+
+        if comment_raw.get("is_anonymous"):
+            comment["is_anonymous"] = True
+            if is_admin:
+                comment["uid"] = comment_raw.get("uid")
+        else:
+            comment["is_anonymous"] = False
+            uid = comment_raw.get("uid")
+            comment["uid"] = uid
+            user_document = await user_collection.find_one(
+                {"_id": uid}, {"avatar": 1, "name": 1}
+            )
+            comment["avatar"] = user_document.get("avatar")
+            comment["name"] = user_document.get("name")
+
+        sub_comments_raw = comment_raw.get("sub")
+        for sub_comment_raw in sub_comments_raw:
+            sub_comment = {
+                "content": sub_comment_raw.get("content"),
+                "time": datetime.fromtimestamp(sub_comment_raw.get("time")).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+            if sub_comment_raw.get("is_anonymous"):
+                sub_comment["is_anonymous"] = True
+                if is_admin:
+                    sub_comment["uid"] = sub_comment_raw.get("uid")
+            else:
+                sub_comment["is_anonymous"] = False
+                uid = sub_comment_raw.get("uid")
+                sub_comment["uid"] = uid
+                user_document = await user_collection.find_one(
+                    {"_id": uid}, {"avatar": 1, "name": 1}
+                )
+                sub_comment["avatar"] = user_document.get("avatar")
+                sub_comment["name"] = user_document.get("name")
+            comment["subs"].append(sub_comment)
+        comments.append(comment)
+
+    return {"status": 0, "comments": comments}
 
 
 @app.post("/routine")
