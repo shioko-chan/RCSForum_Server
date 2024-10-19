@@ -2,6 +2,9 @@ aiofiles
 coloredlogs
 fastapi
 httpx
+ImageHash
 motor
+Pillow
 pydantic
-uvicorn
+pymongo
+python_magic
