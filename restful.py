@@ -375,9 +375,14 @@ async def rank():
 
 @app.get("/image/{filename}")
 async def get_image(filename: str, response: Response):
-    response.headers["Cache-Control"] = "public, max-age=31536000"
-    path = Path(config.UPLOAD_FOLDER).joinpath(filename)
-    if path.exists():
+    if not filename.endswith((".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")):
+        raise Response(status_code=400)
+    
+    upload_folder = Path(config.UPLOAD_FOLDER)
+    path = (upload_folder / filename).resolve()
+    
+    if path.is_file() and str(path).startswith(str(upload_folder.resolve())):
+        response.headers["Cache-Control"] = "public, max-age=31536000"
         return FileResponse(path=path)
     else:
         return Response(status_code=404)
@@ -416,7 +421,7 @@ async def upload_image(authentication: Annotated[str, Header()], image: UploadFi
         return Response(status_code=415)
 
     suffix = f".{detected_type.split("/")[1]}"
-    if suffix not in [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"]:
+    if suffix not in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"):
         return Response(status_code=415)
 
     hash_hex, errno = await asyncio.to_thread(generate_phash, content)
