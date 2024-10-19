@@ -8,3 +8,4 @@ Pillow
 pydantic
 pymongo
 python_magic
+python-multipart
