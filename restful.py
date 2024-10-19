@@ -235,6 +235,7 @@ async def update_authentication(code):
                 name,
                 avatar,
                 await check_if_admin(open_id),
+                open_id,
             ), None
         cid = uuid.uuid4().hex
         info = {
@@ -259,6 +260,7 @@ async def update_authentication(code):
         name,
         avatar,
         await check_if_admin(open_id),
+        open_id,
     ), None
 
 
@@ -274,15 +276,18 @@ async def user_info(authentication: Annotated[str, Header()], uid: str):
     if not user_document:
         return JSONResponse(content={"status": 2}, status_code=404)
 
+    is_me = open_id == uid
     is_admin = await check_if_admin(open_id)
     topics = []
     async for document in poster_collection.find({"uid": uid}, {"comments": 0}):
-        if not is_admin and document.get("is_anonymous"):
+        is_anon = document.get("is_anonymous")
+        if not is_admin and not is_me and is_anon:
             continue
 
         likes_list = document.get("likes")
         topics.append(
             {
+                "is_anonymous": is_anon,
                 "pid": str(document.get("_id")),
                 "title": document.get("title"),
                 "content": document.get("content"),
@@ -297,11 +302,9 @@ async def user_info(authentication: Annotated[str, Header()], uid: str):
 
     return {
         "status": 0,
-        "info": {
-            "name": user_document.get("name"),
-            "avatar": user_document.get("avatar"),
-            "topics": topics,
-        },
+        "name": user_document.get("name"),
+        "avatar": user_document.get("avatar"),
+        "topics": topics,
     }
 
 
@@ -310,9 +313,9 @@ async def login(temp_code_form: TempCodeForm, response: Response):
     val, err = await update_authentication(temp_code_form.code)
     if err is not None:
         return JSONResponse(content={"status": err}, status_code=406)
-    cid, name, avatar, is_admin = val
+    cid, name, avatar, is_admin,open_id = val
     response.headers["Authorization"] = cid
-    return {"status": 0, "name": name, "avatar": avatar, "is_admin": is_admin}
+    return {"status": 0, "name": name, "avatar": avatar, "is_admin": is_admin, "open_id":open_id}
 
 
 @app.post("/checkin/keepalive")
