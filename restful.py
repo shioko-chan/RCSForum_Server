@@ -279,7 +279,7 @@ async def user_info(authentication: Annotated[str, Header()], uid: str):
     is_me = open_id == uid
     is_admin = await check_if_admin(open_id)
     topics = []
-    async for document in poster_collection.find({"uid": uid}, {"comments": 0}):
+    async for document in poster_collection.find({"uid": uid}, {"comments": 0}).sort("time", -1):
         is_anon = document.get("is_anonymous")
         if not is_admin and not is_me and is_anon:
             continue
@@ -362,7 +362,7 @@ async def hello(authentication: Annotated[str, Header()]):
 async def rank():
     rank_list = []
     async with checkin_collection_lock:
-        async for mark in checkin_collection.find({}, {"_id": 1, "time": 1}):
+        async for mark in checkin_collection.find({}, {"_id": 1, "time": 1}).sort("time", -1):
             open_id = mark.get("_id")
             user_document = await user_collection.find_one({"_id": open_id})
             if user_document:
@@ -608,8 +608,8 @@ async def create_comment(
         "time": time.time(),
         "uid": open_id,
     }
-    if create_comment_form.repeat_id is not None:
-        target = f"{target}.{create_comment_form.repeat_id}.sub"
+    if create_comment_form.index_1 is not None:
+        target = f"{target}.{create_comment_form.index_1}.sub"
     else:
         content["images"] = create_comment_form.images
         content["sub"] = []
@@ -805,3 +805,18 @@ async def routine(x_api_key: Annotated[str, Header()]):
         checkin_collection = db[f"checkin_collection_{index}"]
 
     return {"status": 0}
+
+
+@app.get("/font/{filename}")
+async def get_font(filename: str, response: Response):
+    if not filename.endswith((".otf", ".ttf")):
+        raise Response(status_code=400)
+    
+    folder = Path(config.FONT_FOLDER)
+    path = (folder / filename).resolve()
+    
+    if path.is_file() and str(path).startswith(str(folder.resolve())):
+        response.headers["Cache-Control"] = "public, max-age=31536000"
+        return FileResponse(path=path)
+    else:
+        return Response(status_code=404)

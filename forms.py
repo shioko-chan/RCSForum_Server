@@ -30,7 +30,7 @@ class CreateCommentForm(BaseModel):
     is_anonymous: bool
     pid: str
     images: List[str]
-    repeat_id: Optional[int] = None
+    index_1: Optional[int] = None
 
 
 class LikeCommentForm(BaseModel):
