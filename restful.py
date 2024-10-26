@@ -1,6 +1,13 @@
-from typing import Annotated
-from fastapi import FastAPI, Response, Header, UploadFile, Depends, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from typing import Annotated, Optional, Union
+from fastapi import (
+    FastAPI,
+    Response,
+    Header,
+    UploadFile,
+    Depends,
+    HTTPException,
+)
+from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
@@ -13,6 +20,8 @@ import magic
 import httpx
 import aiofiles
 
+from uuid import UUID
+from collections import defaultdict
 from PIL import Image
 from io import BytesIO
 from datetime import datetime
@@ -35,6 +44,10 @@ from forms import (
     DeleteCommentForm,
 )
 import config
+
+logging.basicConfig(
+    format="%(levelname)s - %(message)s - %(asctime)s", level=logging.INFO
+)
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=logging.INFO, logger=logger)
@@ -137,8 +150,10 @@ async def check_if_admin(open_id: str):
         return (
             await admin_collection.find_one({"_id": open_id}, {"_id": 1})
         ) is not None
-    except:
-        print(open_id, type(open_id))
+    except Exception as e:
+        logger.error(
+            "an error occur while check admin qualifications, %s", e, exc_info=True
+        )
 
 
 app = FastAPI(lifespan=lifespan)
@@ -161,9 +176,11 @@ async def limited_api_req(url, headers, json=None, method="POST"):
                 )
 
 
-async def auth_dependency(authentication: Annotated[str, Header()]):
-    res, open_id = await authenticate(authentication, "strong")
+async def auth_dependency(authentication: Annotated[UUID, Header()]):
+    res, open_id = await authenticate(authentication.hex, "strong")
     if not res:
+        error = open_id
+        logger.warn("a request failed at authentication, more info: %s", error)
         raise HTTPException(detail={"status": 1}, status_code=401)
     return open_id
 
@@ -184,8 +201,14 @@ async def authenticate(user_token: str, magnitude="strong"):
         case _:
             raise ValueError(f"Magnitude {magnitude} is not defined")
 
+    def _format_time(timestamp):
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
     if time.time() - user_document.get("time") > expire_duration:
-        return False, f"cid {user_token} EXPIRED"
+        return (
+            False,
+            f"cid {user_token} EXPIRED, current time is {_format_time(time.time())}, expiration is {_format_time(user_document.get("time")+expire_duration)}",
+        )
 
     return True, user_document.get("_id")
 
@@ -379,7 +402,7 @@ async def hello(open_id: Annotated[str, Depends(auth_dependency)]):
     return {"status": 0}
 
 
-@app.get("/checkin/rank")
+@app.get("/checkin/ranks")
 async def rank():
     rank_list = []
     async with checkin_collection_lock:
@@ -399,15 +422,35 @@ async def rank():
     return {"status": 0, "rank": rank_list}
 
 
-@app.get("/checkin/rankacc")
+@app.get("/checkin/ranksacc")
 async def rankacc():
     try:
-        cnt = checkin_collections.find_one().get("index")
+        cnt = (await checkin_collections.find_one()).get("index")
     except Exception as e:
         logger.error("in rank acc, an error occur: %s", e, exc_info=True)
-        raise HTTPException(status_code=400)
+        raise HTTPException(status_code=500)
+    res = defaultdict(float)
     for i in range(cnt):
-        pass
+        async for mark in db[f"checkin_collection_{i}"].find({}, {"_id": 1, "time": 1}):
+            res[mark.get("_id")] += mark.get("time")
+
+    rank_list = []
+    for open_id, time in await asyncio.to_thread(
+        sorted, res.items(), key=lambda item: item[1], reverse=True
+    ):
+        user_document = await user_collection.find_one({"_id": open_id})
+        if user_document:
+            rank_list.append(
+                {
+                    "avatar": user_document.get("avatar"),
+                    "name": user_document.get("name"),
+                    "time": mark.get("time"),
+                }
+            )
+    return {
+        "status": 0,
+        "rank": rank_list,
+    }
 
 
 @app.get("/image/{filename}")
@@ -425,7 +468,7 @@ async def get_image(filename: str, response: Response):
         raise HTTPException(status_code=404)
 
 
-def generate_phash(content: bytes) -> tuple[str, int]:
+def generate_phash(content: bytes) -> tuple[Optional[str], Union[int, BytesIO]]:
     try:
         stream = BytesIO(content)
         image = Image.open(stream)
@@ -440,7 +483,26 @@ def generate_phash(content: bytes) -> tuple[str, int]:
     except Exception as e:
         logger.error("An error occurred while hashing image, %s", e, exc_info=True)
         return None, 2
-    return str(phash_value), 0
+    stream.seek(0)
+    return str(phash_value), stream
+
+
+def compress(
+    stream: BytesIO, ext: str, resize_ratio=0.75, quality=75
+) -> Optional[BytesIO]:
+    try:
+        img = Image.open(stream)
+        width, height = img.size
+        img = img.resize(
+            (int(width * resize_ratio), int(height * resize_ratio)), Image.LANCZOS
+        )
+        new_stream = BytesIO()
+        img.save(new_stream, format=ext, quality=quality, optimize=True)
+        new_stream.seek(0)
+        return new_stream
+    except Exception as e:
+        logger.error("An error occurred while compressing image, %s", e, exc_info=True)
+        return None
 
 
 @app.post("/image/upload")
@@ -459,20 +521,37 @@ async def upload_image(
     if suffix not in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"):
         raise HTTPException(status_code=415)
 
-    hash_hex, errno = await asyncio.to_thread(generate_phash, content)
-    match errno:
-        case 1:
-            raise HTTPException(status_code=415)
-        case 2:
-            raise HTTPException(status_code=500)
+    hash_hex, result = await asyncio.to_thread(generate_phash, content)
+    if hash_hex is None:
+        match result:
+            case 1:
+                raise HTTPException(status_code=415)
+            case 2:
+                raise HTTPException(status_code=500)
+    content_stream = result
 
     filename = f"{hash_hex}{suffix}"
-    path = Path(config.UPLOAD_FOLDER).joinpath(filename)
+    path = Path(config.UPLOAD_FOLDER) / filename
     if path.exists():
         return filename
+
+    extension_to_format = {
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".png": "PNG",
+        ".gif": "GIF",
+        ".bmp": "BMP",
+        ".webp": "WEBP",
+    }
+
+    content_stream = await asyncio.to_thread(
+        compress, content_stream, extension_to_format[suffix]
+    )
+    if content_stream is None:
+        raise HTTPException(status_code=500)
     try:
         async with aiofiles.open(path, "wb") as out_image:
-            await out_image.write(content)
+            await out_image.write(content_stream.getbuffer())
     except Exception as e:
         logger.error("An error occurred while storing image, %s", e, exc_info=True)
         raise HTTPException(status_code=500)
@@ -551,7 +630,7 @@ async def delete_topic(
     if not poster_document:
         raise HTTPException(status_code=406)
 
-    if poster_document.get("uid") != open_id and await check_if_admin(open_id):
+    if poster_document.get("uid") != open_id and not await check_if_admin(open_id):
         raise HTTPException(status_code=403)
 
     if (
@@ -630,7 +709,6 @@ async def create_comment(
     else:
         content["images"] = create_comment_form.images
         content["sub"] = []
-    print({"$push": {target: content}})
     if (
         not (
             await poster_collection.update_one(
@@ -654,9 +732,9 @@ async def like_comment(
     )
     if poster_document is None:
         raise HTTPException(status_code=406)
-    target = f"comments.{like_comment_form.index1}"
-    if like_comment_form.index2 is not None:
-        target = f"{target}.sub.{like_comment_form.index2}"
+    target = f"comments.{like_comment_form.index_1}"
+    if like_comment_form.index_2 is not None:
+        target = f"{target}.sub.{like_comment_form.index_2}"
     if (
         await poster_collection.update_one(
             {"_id": ObjectId(like_comment_form.pid)},
@@ -678,9 +756,9 @@ async def unlike_topic(
     )
     if poster_document is None:
         raise HTTPException(status_code=406)
-    target = f"comments.{unlike_comment_form.index1}"
-    if unlike_comment_form.index2 is not None:
-        target = f"{target}.sub.{unlike_comment_form.index2}"
+    target = f"comments.{unlike_comment_form.index_1}"
+    if unlike_comment_form.index_2 is not None:
+        target = f"{target}.sub.{unlike_comment_form.index_2}"
     if (
         await poster_collection.update_one(
             {"_id": ObjectId(unlike_comment_form.pid)},
@@ -706,22 +784,22 @@ async def delete_comment(
     if not comments:
         raise HTTPException(status_code=406)
 
-    if delete_comment_form.index1 >= len(comments):
+    if delete_comment_form.index_1 >= len(comments):
         raise HTTPException(status_code=406)
 
-    comment = comments[delete_comment_form.index1]
-    if delete_comment_form.index2 is not None:
+    comment = comments[delete_comment_form.index_1]
+    if delete_comment_form.index_2 is not None:
         comments = comment.get("sub")
-        if delete_comment_form.index2 >= len(comments):
+        if delete_comment_form.index_2 >= len(comments):
             raise HTTPException(status_code=406)
-        comment = comments[delete_comment_form.index2]
+        comment = comments[delete_comment_form.index_2]
 
-    if comment.get("uid") != open_id and await check_if_admin(open_id):
+    if comment.get("uid") != open_id and not await check_if_admin(open_id):
         raise HTTPException(status_code=403)
 
-    target = f"comments.{delete_comment_form.index1}"
-    if delete_comment_form.index2 is not None:
-        target = f"{target}.sub.{delete_comment_form.index2}"
+    target = f"comments.{delete_comment_form.index_1}"
+    if delete_comment_form.index_2 is not None:
+        target = f"{target}.sub.{delete_comment_form.index_2}"
 
     if (
         not (
@@ -818,16 +896,16 @@ async def routine(x_api_key: Annotated[str, Header()]):
     return {"status": 0}
 
 
-@app.get("/font/{filename}")
-async def get_font(filename: str, response: Response):
-    if not filename.endswith((".otf", ".ttf")):
-        raise HTTPException(status_code=400)
+# @app.get("/font/{filename}")
+# async def get_font(filename: str, response: Response):
+#     if not filename.endswith((".otf", ".ttf")):
+#         raise HTTPException(status_code=400)
 
-    folder = Path(config.FONT_FOLDER)
-    path = (folder / filename).resolve()
+#     folder = Path(config.FONT_FOLDER)
+#     path = (folder / filename).resolve()
 
-    if path.is_file() and str(path).startswith(str(folder.resolve())):
-        response.headers["Cache-Control"] = "public, max-age=31536000"
-        return FileResponse(path=path)
-    else:
-        raise HTTPException(status_code=404)
+#     if path.is_file() and str(path).startswith(str(folder.resolve())):
+#         response.headers["Cache-Control"] = "public, max-age=31536000"
+#         return FileResponse(path=path)
+#     else:
+#         raise HTTPException(status_code=404)

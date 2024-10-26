@@ -1,5 +1,18 @@
 from pydantic import BaseModel
 from typing import List, Optional
+from bson.objectid import ObjectId
+
+
+class PyObjectId(ObjectId):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, v, _) -> "PyObjectId":
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid ObjectId")
+        return ObjectId(v)
 
 
 class TempCodeForm(BaseModel):
@@ -14,38 +27,38 @@ class CreatePosterForm(BaseModel):
 
 
 class LikeTopicForm(BaseModel):
-    pid: str
+    pid: PyObjectId
 
 
 class UnlikeTopicForm(BaseModel):
-    pid: str
+    pid: PyObjectId
 
 
 class DeleteTopicForm(BaseModel):
-    pid: str
+    pid: PyObjectId
 
 
 class CreateCommentForm(BaseModel):
     content: str
     is_anonymous: bool
-    pid: str
+    pid: PyObjectId
     images: List[str]
     index_1: Optional[int] = None
 
 
 class LikeCommentForm(BaseModel):
-    pid: str
-    index1: int
-    index2: Optional[int] = None
+    pid: PyObjectId
+    index_1: int
+    index_2: Optional[int] = None
 
 
 class UnlikeCommentForm(BaseModel):
-    pid: str
-    index1: int
-    index2: Optional[int] = None
+    pid: PyObjectId
+    index_1: int
+    index_2: Optional[int] = None
 
 
 class DeleteCommentForm(BaseModel):
-    pid: str
-    index1: int
-    index2: Optional[int] = None
+    pid: PyObjectId
+    index_1: int
+    index_2: Optional[int] = None
