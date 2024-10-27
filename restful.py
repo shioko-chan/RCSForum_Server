@@ -666,7 +666,7 @@ async def get_topic(open_id: Annotated[str, Depends(auth_dependency)], page: int
 
         if document.get("is_anonymous"):
             topic["is_anonymous"] = True
-            if is_admin:
+            if is_admin or open_id == document.get("uid"):
                 topic["uid"] = document.get("uid")
         else:
             topic["is_anonymous"] = False
@@ -678,7 +678,6 @@ async def get_topic(open_id: Annotated[str, Depends(auth_dependency)], page: int
             topic["name"] = user_document.get("name")
 
         topics.append(topic)
-
     return {"status": 0, "topics": topics}
 
 
@@ -832,10 +831,11 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
                 "likes": len(likes_list),
                 "liked": open_id in likes_list,
             }
+            uid = document.get("uid")
             if document.get("is_anonymous"):
                 comment["is_anonymous"] = True
-                if is_admin:
-                    comment["uid"] = document.get("uid")
+                if is_admin or open_id == uid:
+                    comment["uid"] = uid
             else:
                 comment["is_anonymous"] = False
                 uid = document.get("uid")
@@ -860,13 +860,13 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
                 "likes": len(likes_list),
                 "liked": open_id in likes_list,
             }
+            uid = document.get("uid")
             if document.get("is_anonymous"):
                 sub_comment["is_anonymous"] = True
-                if is_admin:
-                    sub_comment["uid"] = document.get("uid")
+                if is_admin or open_id == uid:
+                    sub_comment["uid"] = uid
             else:
                 sub_comment["is_anonymous"] = False
-                uid = document.get("uid")
                 sub_comment["uid"] = uid
                 user_document = await user_collection.find_one(
                     {"_id": uid}, {"avatar": 1, "name": 1}
