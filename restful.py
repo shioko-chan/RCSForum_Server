@@ -787,19 +787,22 @@ async def delete_comment(
     if comment.get("uid") != open_id and not await check_if_admin(open_id):
         raise HTTPException(status_code=403)
 
+    fields = ["content", "is_anonymous", "likes", "time", "uid"]
     target = f"comments.{delete_comment_form.index_1}"
-    if delete_comment_form.index_2 is not None:
+
+    if delete_comment_form.index_2 is None:
+        fields.append("images")
+    else:
         target = f"{target}.sub.{delete_comment_form.index_2}"
 
-    if (
-        not (
-            await poster_collection.update_one(
-                {"_id": delete_comment_form.pid},
-                {"$unset": {target: ""}},
-            )
-        ).modified_count
-        != 1
-    ):
+    targets = {f"{target}.{field}": "" for field in fields}
+
+    res = await poster_collection.update_one(
+        {"_id": delete_comment_form.pid},
+        {"$unset": targets, "$set": {f"{target}.is_deleted": True}},
+    )
+    if res.modified_count != 1:
+        print(res.__str__(), res.modified_count)
         raise HTTPException(status_code=500)
 
     return {"status": 0}
@@ -817,37 +820,34 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
     comments = []
     is_admin = await check_if_admin(open_id)
     for document in documents:
-        if document is None:
-            comments.append({})
-            continue
-
-        likes_list = document.get("likes")
-        comment = {
-            "content": document.get("content"),
-            "time": datetime.fromtimestamp(document.get("time")).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            "images": document.get("images"),
-            "subs": [],
-            "likes": len(likes_list),
-            "liked": open_id in likes_list,
-        }
-        if document.get("is_anonymous"):
-            comment["is_anonymous"] = True
-            if is_admin:
-                comment["uid"] = document.get("uid")
-        else:
-            comment["is_anonymous"] = False
-            uid = document.get("uid")
-            comment["uid"] = uid
-            user_document = await user_collection.find_one(
-                {"_id": uid}, {"avatar": 1, "name": 1}
-            )
-            comment["avatar"] = user_document.get("avatar")
-            comment["name"] = user_document.get("name")
+        if not document.get("is_deleted"):
+            likes_list = document.get("likes")
+            comment = {
+                "content": document.get("content"),
+                "time": datetime.fromtimestamp(document.get("time")).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "images": document.get("images"),
+                "subs": [],
+                "likes": len(likes_list),
+                "liked": open_id in likes_list,
+            }
+            if document.get("is_anonymous"):
+                comment["is_anonymous"] = True
+                if is_admin:
+                    comment["uid"] = document.get("uid")
+            else:
+                comment["is_anonymous"] = False
+                uid = document.get("uid")
+                comment["uid"] = uid
+                user_document = await user_collection.find_one(
+                    {"_id": uid}, {"avatar": 1, "name": 1}
+                )
+                comment["avatar"] = user_document.get("avatar")
+                comment["name"] = user_document.get("name")
 
         for document in document.get("sub"):
-            if document is None:
+            if document.get("is_deleted"):
                 comment["subs"].append({})
                 continue
 
