@@ -48,7 +48,10 @@ from forms import (
 import config
 
 logging.basicConfig(
-    format="%(levelname)s - %(message)s - %(asctime)s", level=logging.INFO
+    filename=config.LOG_PATH,
+    filemode="a",
+    format="%(levelname)s - %(message)s - %(asctime)s",
+    level=logging.INFO,
 )
 
 logger = logging.getLogger(__name__)
