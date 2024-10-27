@@ -62,3 +62,11 @@ class DeleteCommentForm(BaseModel):
     pid: PyObjectId
     index_1: int
     index_2: Optional[int] = None
+
+
+class CreateAdminForm(BaseModel):
+    open_id: str
+
+
+class RemoveAdminForm(BaseModel):
+    open_id: str

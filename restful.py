@@ -1,4 +1,5 @@
 from typing import Annotated, Optional, Union
+from bson import ObjectId
 from fastapi import (
     FastAPI,
     Response,
@@ -10,7 +11,6 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from motor.motor_asyncio import AsyncIOMotorClient
-from bson.objectid import ObjectId
 
 import imagehash
 
@@ -42,6 +42,8 @@ from forms import (
     LikeCommentForm,
     UnlikeCommentForm,
     DeleteCommentForm,
+    CreateAdminForm,
+    RemoveAdminForm,
 )
 import config
 
@@ -359,7 +361,7 @@ async def login(temp_code_form: TempCodeForm, response: Response):
     if err is not None:
         return HTTPException(status_code=406)
     cid, name, avatar, is_admin, open_id = val
-    response.headers["Authorization"] = cid
+    response.headers["authentication"] = cid
     return {
         "status": 0,
         "name": name,
@@ -444,7 +446,7 @@ async def rankacc():
                 {
                     "avatar": user_document.get("avatar"),
                     "name": user_document.get("name"),
-                    "time": mark.get("time"),
+                    "time": time,
                 }
             )
     return {
@@ -586,14 +588,12 @@ async def create_topic(
 async def like_topic(
     open_id: Annotated[str, Depends(auth_dependency)], like_topic_form: LikeTopicForm
 ):
-    poster_document = await poster_collection.find_one(
-        {"_id": ObjectId(like_topic_form.pid)}
-    )
+    poster_document = await poster_collection.find_one({"_id": like_topic_form.pid})
     if poster_document is None:
         raise HTTPException(status_code=406)
     if (
         await poster_collection.update_one(
-            {"_id": ObjectId(like_topic_form.pid)}, {"$addToSet": {"likes": open_id}}
+            {"_id": like_topic_form.pid}, {"$addToSet": {"likes": open_id}}
         )
     ).modified_count != 1:
         raise HTTPException(status_code=500)
@@ -605,14 +605,12 @@ async def unlike_topic(
     open_id: Annotated[str, Depends(auth_dependency)],
     unlike_topic_form: UnlikeTopicForm,
 ):
-    poster_document = await poster_collection.find_one(
-        {"_id": ObjectId(unlike_topic_form.pid)}
-    )
+    poster_document = await poster_collection.find_one({"_id": unlike_topic_form.pid})
     if poster_document is None:
         raise HTTPException(status_code=406)
     if (
         await poster_collection.update_one(
-            {"_id": ObjectId(unlike_topic_form.pid)}, {"$pull": {"likes": open_id}}
+            {"_id": unlike_topic_form.pid}, {"$pull": {"likes": open_id}}
         )
     ).modified_count != 1:
         raise HTTPException(status_code=500)
@@ -624,9 +622,7 @@ async def delete_topic(
     open_id: Annotated[str, Depends(auth_dependency)],
     delete_topic_form: DeleteTopicForm,
 ):
-    poster_document = await poster_collection.find_one(
-        {"_id": ObjectId(delete_topic_form.pid)}
-    )
+    poster_document = await poster_collection.find_one({"_id": delete_topic_form.pid})
     if not poster_document:
         raise HTTPException(status_code=406)
 
@@ -691,9 +687,7 @@ async def create_comment(
     open_id: Annotated[str, Depends(auth_dependency)],
     create_comment_form: CreateCommentForm,
 ):
-    poster_document = await poster_collection.find_one(
-        {"_id": ObjectId(create_comment_form.pid)}
-    )
+    poster_document = await poster_collection.find_one({"_id": create_comment_form.pid})
     if not poster_document:
         raise HTTPException(status_code=406)
     target = "comments"
@@ -727,9 +721,7 @@ async def like_comment(
     open_id: Annotated[str, Depends(auth_dependency)],
     like_comment_form: LikeCommentForm,
 ):
-    poster_document = await poster_collection.find_one(
-        {"_id": ObjectId(like_comment_form.pid)}
-    )
+    poster_document = await poster_collection.find_one({"_id": like_comment_form.pid})
     if poster_document is None:
         raise HTTPException(status_code=406)
     target = f"comments.{like_comment_form.index_1}"
@@ -737,7 +729,7 @@ async def like_comment(
         target = f"{target}.sub.{like_comment_form.index_2}"
     if (
         await poster_collection.update_one(
-            {"_id": ObjectId(like_comment_form.pid)},
+            {"_id": like_comment_form.pid},
             {"$addToSet": {f"{target}.likes": open_id}},
         )
     ).modified_count != 1:
@@ -751,9 +743,7 @@ async def unlike_topic(
     unlike_comment_form: UnlikeCommentForm,
 ):
 
-    poster_document = await poster_collection.find_one(
-        {"_id": ObjectId(unlike_comment_form.pid)}
-    )
+    poster_document = await poster_collection.find_one({"_id": unlike_comment_form.pid})
     if poster_document is None:
         raise HTTPException(status_code=406)
     target = f"comments.{unlike_comment_form.index_1}"
@@ -761,7 +751,7 @@ async def unlike_topic(
         target = f"{target}.sub.{unlike_comment_form.index_2}"
     if (
         await poster_collection.update_one(
-            {"_id": ObjectId(unlike_comment_form.pid)},
+            {"_id": unlike_comment_form.pid},
             {"$pull": {f"{target}.likes": open_id}},
         )
     ).modified_count != 1:
@@ -775,7 +765,7 @@ async def delete_comment(
     delete_comment_form: DeleteCommentForm,
 ):
     poster_document = await poster_collection.find_one(
-        {"_id": ObjectId(delete_comment_form.pid)}, {"comments": 1}
+        {"_id": delete_comment_form.pid}, {"comments": 1}
     )
     if not poster_document:
         raise HTTPException(status_code=406)
@@ -804,7 +794,7 @@ async def delete_comment(
     if (
         not (
             await poster_collection.update_one(
-                {"_id": ObjectId(delete_comment_form.pid)},
+                {"_id": delete_comment_form.pid},
                 {"$unset": {target: ""}},
             )
         ).modified_count
@@ -827,6 +817,10 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
     comments = []
     is_admin = await check_if_admin(open_id)
     for document in documents:
+        if document is None:
+            comments.append({})
+            continue
+
         likes_list = document.get("likes")
         comment = {
             "content": document.get("content"),
@@ -853,6 +847,10 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
             comment["name"] = user_document.get("name")
 
         for document in document.get("sub"):
+            if document is None:
+                comment["subs"].append({})
+                continue
+
             likes_list = document.get("likes")
             sub_comment = {
                 "content": document.get("content"),
@@ -876,16 +874,20 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
                 sub_comment["avatar"] = user_document.get("avatar")
                 sub_comment["name"] = user_document.get("name")
             comment["subs"].append(sub_comment)
+
         comments.append(comment)
 
     return {"status": 0, "comments": comments}
 
 
-@app.post("/routine")
-async def routine(x_api_key: Annotated[str, Header()]):
+async def x_api_key_dependency(x_api_key: Annotated[str, Header()]):
     if x_api_key != config.X_API_KEY:
         raise HTTPException(status_code=401)
+    return True
 
+
+@app.post("/routine")
+async def routine(_: Annotated[bool, Depends(x_api_key_dependency)]):
     index = (
         await checkin_collections.find_one_and_update({}, {"$inc": {"index": 1}})
     ).get("index")
@@ -893,6 +895,32 @@ async def routine(x_api_key: Annotated[str, Header()]):
     async with checkin_collection_lock:
         checkin_collection = db[f"checkin_collection_{index}"]
 
+    return {"status": 0}
+
+
+@app.post("/setadmin")
+async def set_admin(
+    _: Annotated[bool, Depends(x_api_key_dependency)],
+    create_admin_form: CreateAdminForm,
+):
+    if (await admin_collection.find_one({"_id": create_admin_form.open_id})) is None:
+        if (
+            await admin_collection.insert_one({"_id": create_admin_form.open_id})
+        ).inserted_id is None:
+            raise HTTPException(status_code=500)
+
+    await user_collection.delete_one({"_id": create_admin_form.open_id})
+
+    return {"status": 0}
+
+
+@app.post("/removeadmin")
+async def remove_admin(
+    _: Annotated[bool, Depends(x_api_key_dependency)],
+    remove_admin_form: RemoveAdminForm,
+):
+    await admin_collection.delete_one({"_id": remove_admin_form.open_id})
+    await user_collection.delete_one({"_id": remove_admin_form.open_id})
     return {"status": 0}
 
 
