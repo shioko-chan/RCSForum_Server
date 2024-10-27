@@ -325,6 +325,12 @@ async def update_authentication(code):
     ), None
 
 
+@app.get("/ifuseradmin/{uid}")
+async def check_admin_route(uid: str, response: Response):
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return {"status": 0, "is_admin": await check_if_admin(uid)}
+
+
 @app.get("/user/{uid}")
 async def user_info(open_id: Annotated[str, Depends(auth_dependency)], uid: str):
     user_document = await user_collection.find_one(
@@ -387,7 +393,7 @@ checkin_collection = db["checkin_collection_0"]
 
 
 async def checkin_dependency():
-    index = (await checkin_collections.find_one({})).get("index")
+    index = (await checkin_collections.find_one({})).get("index") - 1
     return db[f"checkin_collection_{index}"]
 
 
@@ -429,22 +435,23 @@ async def hello(
 
 
 @app.get("/checkin/ranks")
-async def rank():
+async def rank(
+    checkin_collection: Annotated[AsyncIOMotorCollection, Depends(checkin_dependency)]
+):
     rank_list = []
-    async with checkin_collection_lock:
-        async for mark in checkin_collection.find({}, {"_id": 1, "time": 1}).sort(
-            "time", -1
-        ):
-            open_id = mark.get("_id")
-            user_document = await user_collection.find_one({"_id": open_id})
-            if user_document:
-                rank_list.append(
-                    {
-                        "avatar": user_document.get("avatar"),
-                        "name": user_document.get("name"),
-                        "time": mark.get("time"),
-                    }
-                )
+    async for mark in checkin_collection.find({}, {"_id": 1, "time": 1}).sort(
+        "time", -1
+    ):
+        open_id = mark.get("_id")
+        user_document = await user_collection.find_one({"_id": open_id})
+        if user_document:
+            rank_list.append(
+                {
+                    "avatar": user_document.get("avatar"),
+                    "name": user_document.get("name"),
+                    "time": mark.get("time"),
+                }
+            )
     return {"status": 0, "rank": rank_list}
 
 
