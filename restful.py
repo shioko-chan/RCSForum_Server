@@ -10,7 +10,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 
 import imagehash
 
@@ -67,8 +67,6 @@ user_collection = db["user"]
 admin_collection = db["admin"]
 
 checkin_collections = db["checkin_collections"]
-checkin_collection = db["checkin_collection_0"]
-checkin_collection_lock = asyncio.Lock()
 
 Path(config.UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
 
@@ -139,15 +137,25 @@ async def renew_app_token(ttl):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    index = await user_collection.create_index("cid")
-    logger.info("create index on user collection, index name: %s", index)
+async def lifespan(_: FastAPI):
+    async def check_index():
+        for index in (await user_collection.index_information()).values():
+            if "cid" in index["key"][0]:
+                return True
+        return False
+
+    if not await check_index():
+        index = await user_collection.create_index("cid")
+        logger.info("create index on user collection, index name: %s", index)
 
     if (await checkin_collections.find_one()) is None:
         await checkin_collections.insert_one({"index": 1})
     ttl = await update_app_access_token()
     asyncio.create_task(renew_app_token(ttl=ttl))
+
     yield
+
+    client.close()
 
 
 async def check_if_admin(open_id: str):
@@ -167,18 +175,19 @@ app = FastAPI(lifespan=lifespan)
 @retry_with_limit(max_retry=3)
 async def limited_api_req(url, headers, json=None, method="POST"):
     async with httpx.AsyncClient() as client:
-        match method:
-            case "POST":
-                return await client.post(
-                    url=url,
-                    headers=headers,
-                    json=json,
-                )
-            case "GET":
-                return await client.get(
-                    url=url,
-                    headers=headers,
-                )
+        if method == "POST":
+            return await client.post(
+                url=url,
+                headers=headers,
+                json=json,
+            )
+        elif method == "GET":
+            return await client.get(
+                url=url,
+                headers=headers,
+            )
+        else:
+            raise NotImplementedError
 
 
 async def auth_dependency(authentication: Annotated[UUID, Header()]):
@@ -374,36 +383,48 @@ async def login(temp_code_form: TempCodeForm, response: Response):
     }
 
 
+checkin_collection = db["checkin_collection_0"]
+
+
+async def checkin_dependency():
+    index = (await checkin_collections.find_one({})).get("index")
+    return db[f"checkin_collection_{index}"]
+
+
 @app.post("/checkin/keepalive")
-async def keep_alive(open_id: Annotated[str, Depends(auth_dependency)]):
-    async with checkin_collection_lock:
-        document = await checkin_collection.find_one({"_id": open_id})
-        if document:
-            if (
-                await checkin_collection.update_one(
-                    {"_id": open_id}, {"$inc": {"time": config.KEEP_ALIVE_INTERVAL}}
-                )
-            ).modified_count != 1:
-                raise HTTPException(status_code=500)
-        else:
-            if (
-                await checkin_collection.insert_one(
-                    {"_id": open_id, "time": config.KEEP_ALIVE_INTERVAL}
-                )
-            ).inserted_id is None:
-                raise HTTPException(status_code=500)
+async def keep_alive(
+    open_id: Annotated[str, Depends(auth_dependency)],
+    checkin_collection: Annotated[AsyncIOMotorCollection, Depends(checkin_dependency)],
+):
+    document = await checkin_collection.find_one({"_id": open_id})
+    if document:
+        if (
+            await checkin_collection.update_one(
+                {"_id": open_id}, {"$inc": {"time": config.KEEP_ALIVE_INTERVAL}}
+            )
+        ).modified_count != 1:
+            raise HTTPException(status_code=500)
+    else:
+        if (
+            await checkin_collection.insert_one(
+                {"_id": open_id, "time": config.KEEP_ALIVE_INTERVAL}
+            )
+        ).inserted_id is None:
+            raise HTTPException(status_code=500)
     return {"status": 0}
 
 
 @app.post("/checkin/hello")
-async def hello(open_id: Annotated[str, Depends(auth_dependency)]):
-    async with checkin_collection_lock:
-        document = await checkin_collection.find_one({"_id": open_id})
-        if not document:
-            if (
-                await checkin_collection.insert_one({"_id": open_id, "time": 0})
-            ).inserted_id is None:
-                raise HTTPException(status_code=500)
+async def hello(
+    open_id: Annotated[str, Depends(auth_dependency)],
+    checkin_collection: Annotated[AsyncIOMotorCollection, Depends(checkin_dependency)],
+):
+    document = await checkin_collection.find_one({"_id": open_id})
+    if not document:
+        if (
+            await checkin_collection.insert_one({"_id": open_id, "time": 0})
+        ).inserted_id is None:
+            raise HTTPException(status_code=500)
     return {"status": 0}
 
 
@@ -822,18 +843,25 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
     comments = []
     is_admin = await check_if_admin(open_id)
     for document in documents:
-        if not document.get("is_deleted"):
+        comment = {
+            "subs": [],
+            "is_deleted": False,
+        }
+        if document.get("is_deleted"):
+            comment["is_deleted"] = True
+        else:
             likes_list = document.get("likes")
-            comment = {
-                "content": document.get("content"),
-                "time": datetime.fromtimestamp(document.get("time")).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "images": document.get("images"),
-                "subs": [],
-                "likes": len(likes_list),
-                "liked": open_id in likes_list,
-            }
+            comment.update(
+                {
+                    "content": document.get("content"),
+                    "time": datetime.fromtimestamp(document.get("time")).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    "images": document.get("images"),
+                    "likes": len(likes_list),
+                    "liked": open_id in likes_list,
+                }
+            )
             uid = document.get("uid")
             if document.get("is_anonymous"):
                 comment["is_anonymous"] = True
@@ -851,7 +879,7 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
 
         for document in document.get("sub"):
             if document.get("is_deleted"):
-                comment["subs"].append({})
+                comment["subs"].append({"is_deleted": True})
                 continue
 
             likes_list = document.get("likes")
@@ -876,6 +904,7 @@ async def get_comment(open_id: Annotated[str, Depends(auth_dependency)], pid: st
                 )
                 sub_comment["avatar"] = user_document.get("avatar")
                 sub_comment["name"] = user_document.get("name")
+
             comment["subs"].append(sub_comment)
 
         comments.append(comment)
