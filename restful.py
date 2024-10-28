@@ -942,13 +942,7 @@ async def x_api_key_dependency(x_api_key: Annotated[str, Header()]):
 
 @app.post("/routine")
 async def routine(_: Annotated[bool, Depends(x_api_key_dependency)]):
-    index = (
-        await checkin_collections.find_one_and_update({}, {"$inc": {"index": 1}})
-    ).get("index")
-    global checkin_collection
-    async with checkin_collection_lock:
-        checkin_collection = db[f"checkin_collection_{index}"]
-
+    await checkin_collections.update_one({}, {"$inc": {"index": 1}})
     return {"status": 0}
 
 

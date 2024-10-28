@@ -6,3 +6,4 @@ images
 server
 fonts
 *.log
+*.sh
