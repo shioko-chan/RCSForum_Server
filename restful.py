@@ -486,6 +486,21 @@ async def rankacc():
     }
 
 
+@app.get("/stickers/{filename}")
+async def get_stickers(filename: str, response: Response):
+    if not filename.endswith((".jpg", ".png", ".gif")):
+        raise HTTPException(status_code=400)
+
+    sticker_folder = Path(config.STICKER_FOLDER)
+    path = (sticker_folder / filename).resolve()
+
+    if path.is_file() and str(path).startswith(str(sticker_folder.resolve())):
+        response.headers["Cache-Control"] = "public, max-age=31536000"
+        return FileResponse(path=path)
+    else:
+        raise HTTPException(status_code=404)
+
+
 @app.get("/image/{filename}")
 async def get_image(filename: str, response: Response):
     if not filename.endswith((".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")):
