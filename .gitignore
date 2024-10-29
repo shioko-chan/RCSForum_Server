@@ -6,4 +6,4 @@ images
 server
 fonts
 *.log
-*.sh
+/sh/sh
