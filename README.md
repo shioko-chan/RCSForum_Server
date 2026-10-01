@@ -1,29 +1,31 @@
 # RCSForum Server
 
-`RCSForum` 小程序的 FastAPI 后端。服务使用 MongoDB 存储用户、主题、评论、点赞、管理员和签到数据，并通过飞书开放平台完成用户身份认证。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## 功能
+The FastAPI backend for the `RCSForum` mini-app. It uses MongoDB to store users, topics, comments, likes, administrators, and check-in data, and authenticates users through the Feishu Open Platform.
 
-- 飞书临时登录码换取用户身份
-- 基于服务端会话令牌的接口认证
-- 主题、评论、点赞和删除操作
-- 匿名发帖与管理员权限
-- 图片类型校验、感知哈希、压缩和去重
-- 贴纸与上传图片静态访问
-- 签到在线时长和排行榜
-- 异步 MongoDB 数据访问
+## Features
 
-## 技术栈
+- Exchange a temporary Feishu login code for a user identity
+- API authentication based on server-side session tokens
+- Topics, comments, likes, and deletion operations
+- Anonymous posts and administrator permissions
+- Image type validation, perceptual hashing, compression, and deduplication
+- Static access to stickers and uploaded images
+- Check-in online time tracking and leaderboards
+- Asynchronous MongoDB data access
+
+## Technology stack
 
 - FastAPI
-- MongoDB、Motor、PyMongo
+- MongoDB, Motor, PyMongo
 - HTTPX
-- Pillow、ImageHash、python-magic
+- Pillow, ImageHash, python-magic
 - aiofiles
 
-## 安装
+## Installation
 
-建议使用虚拟环境：
+A virtual environment is recommended:
 
 ```bash
 python -m venv .venv
@@ -32,7 +34,7 @@ pip install -r requirements.txt
 pip install uvicorn
 ```
 
-系统还需要安装 `libmagic`。例如在 Debian/Ubuntu 上：
+The system also needs `libmagic`. For example, on Debian/Ubuntu:
 
 ```bash
 sudo apt install libmagic1
@@ -40,17 +42,17 @@ sudo apt install libmagic1
 
 ## MongoDB
 
-默认连接：
+Default connection:
 
 ```text
 mongodb://localhost:27017/
 ```
 
-数据库名称为 `rcsforum`。启动 API 前请确保 MongoDB 正在运行。
+The database is named `rcsforum`. Ensure MongoDB is running before starting the API.
 
-## 配置
+## Configuration
 
-`restful.py` 从 `config.py` 读取运行参数。配置至少需要覆盖当前代码使用的以下项目：
+`restful.py` reads runtime settings from `config.py`. The configuration must at least cover the following settings used by the current code:
 
 ```python
 APP_ID = "replace-me"
@@ -66,43 +68,43 @@ KEEP_ALIVE_INTERVAL = 30
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 ```
 
-请根据实际代码中的 `config.*` 引用补齐其他字段。不要提交真实的 `APP_SECRET`、令牌或生产路径。
+Add other fields based on the actual `config.*` references in the code. Do not commit real `APP_SECRET` values, tokens, or production paths.
 
-## 启动
+## Starting the server
 
 ```bash
 uvicorn restful:app --host 0.0.0.0 --port 8000
 ```
 
-开发时可以启用自动重载：
+For development, you can enable automatic reloading:
 
 ```bash
 uvicorn restful:app --reload
 ```
 
-然后将 `RCSForum` 客户端中的 API 地址指向该服务。
+Then point the API URL in the `RCSForum` client to this service.
 
-## 数据与文件
+## Data and files
 
-主要集合包括：
+The main collections include:
 
 - `poster`
 - `user`
 - `admin`
 - `checkin_collections`
-- 按周期创建的 `checkin_collection_*`
+- Periodically created `checkin_collection_*` collections
 
-上传图片保存在 `UPLOAD_FOLDER`。服务会验证 MIME 类型、计算感知哈希并压缩图片；相同哈希的文件可直接复用。
+Uploaded images are stored in `UPLOAD_FOLDER`. The service validates MIME types, computes perceptual hashes, and compresses images; files with the same hash can be reused directly.
 
-## 生产部署注意事项
+## Production deployment notes
 
-- 使用 HTTPS 反向代理，不要直接把开发服务器暴露到公网。
-- 将开放平台密钥放入环境变量或秘密管理系统。
-- 为 MongoDB 启用认证、访问控制和备份。
-- 配置上传目录权限、大小限制、请求频率限制和磁盘监控。
-- 检查 CORS、可信代理、日志隐私和令牌过期策略。
-- 当前代码中部分异常路径直接返回通用错误，生产部署前应补充测试和统一错误处理。
+- Use an HTTPS reverse proxy; do not expose the development server directly to the public internet.
+- Store Open Platform secrets in environment variables or a secrets management system.
+- Enable MongoDB authentication, access control, and backups.
+- Configure upload directory permissions, size limits, request rate limits, and disk monitoring.
+- Review CORS, trusted proxies, log privacy, and token expiration policies.
+- Some exception paths in the current code return generic errors directly. Add tests and consistent error handling before deploying to production.
 
 ## License
 
-请参阅仓库中的 `LICENSE`。
+See `LICENSE` in the repository.
